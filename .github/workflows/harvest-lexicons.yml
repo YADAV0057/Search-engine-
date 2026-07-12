@@ -6,10 +6,12 @@
 # deploy.yml's workflow_dispatch trigger.
 #
 # One-time setup before this will work:
-#   1. Repo secret SUPABASE_PROJECT_REF  — your project ref, e.g. abcdefghijk
-#      (Supabase Dashboard > Project Settings > General > Reference ID)
+#   1. Repo secret SUPABASE_PROJECT_ID   — your project ref (same secret
+#      deploy.yml already uses — no need for a second one)
+#      (Supabase Dashboard > Project Settings > General > Project ID)
 #   2. Repo secret HARVEST_SECRET        — same value you set as the
 #      harvest-lexicons function secret in the Supabase Dashboard
+#      (Edge Functions > harvest-lexicons > Secrets)
 #   (Settings > Secrets and variables > Actions, in this GitHub repo)
 #
 # HOW TO RUN:
@@ -34,7 +36,7 @@ jobs:
     steps:
       - name: Call harvest-lexicons
         env:
-          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_ID }}
           HARVEST_SECRET: ${{ secrets.HARVEST_SECRET }}
           ENTITY_TYPES_INPUT: ${{ inputs.entity_types }}
         run: |
