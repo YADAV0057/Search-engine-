@@ -1,0 +1,72 @@
+# SAVE AS: .github/workflows/harvest-lexicons.yml  (repo root — alongside deploy.yml)
+#
+# Manually-triggered workflow that calls the deployed harvest-lexicons Edge
+# Function via curl, so it can be run from the GitHub Actions tab in a
+# browser (mobile or desktop) with no local terminal needed — same idea as
+# deploy.yml's workflow_dispatch trigger.
+#
+# One-time setup before this will work:
+#   1. Repo secret SUPABASE_PROJECT_REF  — your project ref, e.g. abcdefghijk
+#      (Supabase Dashboard > Project Settings > General > Reference ID)
+#   2. Repo secret HARVEST_SECRET        — same value you set as the
+#      harvest-lexicons function secret in the Supabase Dashboard
+#   (Settings > Secrets and variables > Actions, in this GitHub repo)
+#
+# HOW TO RUN:
+#   GitHub repo -> Actions tab -> "Harvest Lexicons" (left sidebar) ->
+#   "Run workflow" button -> optionally fill entity_types -> Run workflow.
+#   Leave entity_types blank to harvest everything (genre, tag, staff,
+#   character, studio, media).
+
+name: Harvest Lexicons
+
+on:
+  workflow_dispatch:
+    inputs:
+      entity_types:
+        description: 'Comma-separated entity types (blank = all: genre,tag,staff,character,studio,media)'
+        required: false
+        default: ''
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call harvest-lexicons
+        env:
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
+          HARVEST_SECRET: ${{ secrets.HARVEST_SECRET }}
+          ENTITY_TYPES_INPUT: ${{ inputs.entity_types }}
+        run: |
+          # Build the JSON body: {} for "harvest everything" (the function's
+          # own default), or {"entityTypes":[...]} if specific types were
+          # entered in the workflow_dispatch form.
+          if [ -z "$ENTITY_TYPES_INPUT" ]; then
+            BODY='{}'
+          else
+            # Turn "genre, media" into ["genre","media"]
+            TYPES_JSON=$(echo "$ENTITY_TYPES_INPUT" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -s .)
+            BODY=$(jq -n --argjson types "$TYPES_JSON" '{entityTypes: $types}')
+          fi
+
+          echo "Request body: $BODY"
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "https://${SUPABASE_PROJECT_REF}.functions.supabase.co/harvest-lexicons" \
+            -H "x-harvest-secret: ${HARVEST_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "---- Response ($HTTP_CODE) ----"
+          cat response.json
+          echo ""
+
+          # Long harvest runs (e.g. first-ever media pagination) can hit the
+          # Edge Function's execution time limit and return a 500/partial
+          # result — that's expected and safe, not a bug. Just re-run this
+          # workflow again; lexicon_sync_state already has the delta
+          # checkpoint, so the next run picks up where this one stopped
+          # instead of restarting from zero.
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::warning::harvest-lexicons returned $HTTP_CODE — if this was a timeout on a large first run, just re-run this workflow; it resumes from lexicon_sync_state, it doesn't restart."
+          fi
