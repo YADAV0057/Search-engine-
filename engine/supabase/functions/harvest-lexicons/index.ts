@@ -64,13 +64,47 @@ function sleep(ms) {
 }
 
 
+// Retry config: AniList 502/503/504 are transient upstream blips (their
 // server, not ours — confirmed 2026-07-13 when a 504 hit right at the
 // start of `staff` pagination after genre/tag/theme/demographic had
 // already succeeded). Retry a couple times with exponential backoff
 // before giving up, so a single blip doesn't fail the whole harvest run.
-const RETRYABLE_STATUS = new Set([502, 503, 504]);
+//
+// 429 added 2026-07-13 after a second failure (run #5) that completed
+// in only 21s — too fast to be the known 150s idle-timeout non-issue.
+// Likely cause: AniList's 90 req/min rate limit tripped by running the
+// harvest workflow repeatedly in a short window. 429 needs a longer
+// backoff than 502/503/504 since rate-limit windows take longer to
+// clear than a server hiccup — starts at 5s instead of 1s.
+const RETRYABLE_STATUS = new Set([429, 502, 503, 504]);
 const MAX_RETRIES = 2;
-const RETRY_BASE_DELAY_MS = 1000; // 1s, then 2s
+const RETRY_BASE_DELAY_MS = 1000; // 1s, then 2s — used for 502/503/504
+const RATE_LIMIT_BASE_DELAY_MS = 5000; // 5s, then 10s — used for 429
+
+async function anilistQuery(query, variables = {}, attempt = 0) {
+  const res = await fetch(ANILIST_API_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+    body: JSON.stringify({ query, variables })
+  });
+
+  if (!res.ok) {
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+      const isRateLimit = res.status === 429;
+      const baseDelay = isRateLimit ? RATE_LIMIT_BASE_DELAY_MS : RETRY_BASE_DELAY_MS;
+      const delay = baseDelay * Math.pow(2, attempt);
+      console.warn(`AniList HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(delay);
+      return anilistQuery(query, variables, attempt + 1);
+    }
+    throw new Error(`AniList HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  if (data.errors) throw new Error(`AniList GraphQL error: ${JSON.stringify(data.errors)}`);
+  return data.data;
+}
+
 
 async function anilistQuery(query, variables = {}, attempt = 0) {
   const res = await fetch(ANILIST_API_URL, {
