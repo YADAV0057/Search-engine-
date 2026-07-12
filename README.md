@@ -140,4 +140,29 @@ and calls it with:
 ```
 POST {ENGINE_URL}
 { "domain": "manga", "query": "...", "filters": { ... } }
+
+
+
 ```
+
+
+## 8. Change log
+
+- **2026-07-13** — Diagnosed a `harvest-lexicons` run failure
+  (`AniList HTTP 504 at anilistQuery`, 23:50:13 run). Not a bug in our
+  code — AniList's own server timed out right as `staff` pagination
+  started; genre/tag/theme/demographic had already synced successfully
+  before the 504 hit. Added a retry-with-backoff wrapper around
+  `anilistQuery()` (retries once or twice on 502/503/504 with
+  exponential backoff — 1s, then 2s — before giving up), so a single
+  upstream blip no longer fails an entire harvest run. Per-page
+  checkpointing (section, `lexicon_sync_state`) already meant a failed
+  run wasn't losing progress; this just avoids needing a manual
+  re-trigger in the first place.
+
+- **2026-07-12** — Engine skeleton stood up: Supabase Edge Function
+  (`supabase/functions/search/`), `search_cache` migration, manga domain
+  wired to AniList → Jikan → Kitsu waterfall, CORS allowlist seeded with
+  moodmanga.in. Stack decision (Supabase + Vercel, Firebase ruled out for
+  compute) recorded in section 3.
+  
