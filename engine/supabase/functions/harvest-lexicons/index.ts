@@ -106,28 +106,6 @@ async function anilistQuery(query, variables = {}, attempt = 0) {
 }
 
 
-async function anilistQuery(query, variables = {}, attempt = 0) {
-  const res = await fetch(ANILIST_API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-    body: JSON.stringify({ query, variables })
-  });
-
-  if (!res.ok) {
-    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
-      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
-      console.warn(`AniList HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
-      await sleep(delay);
-      return anilistQuery(query, variables, attempt + 1);
-    }
-    throw new Error(`AniList HTTP ${res.status}`);
-  }
-
-  const data = await res.json();
-  if (data.errors) throw new Error(`AniList GraphQL error: ${JSON.stringify(data.errors)}`);
-  return data.data;
-}
-
 
 // ---- Static entities: genres + tags/themes/demographics ----
 
