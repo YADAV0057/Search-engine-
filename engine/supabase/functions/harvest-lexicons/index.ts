@@ -200,8 +200,14 @@ async function mangadexQuery(offset, attempt = 0) {
     params.append('contentRating[]', rating);
   }
 
+  // MangaDex asks integrators to identify their client via User-Agent —
+  // added 2026-07-14 after a 400 with no other obvious cause; harmless
+  // either way, and rules this out as a possible factor.
   const res = await fetch(`${MANGADEX_API_URL}?${params.toString()}`, {
-    headers: { 'Accept': 'application/json' }
+    headers: {
+      'Accept': 'application/json',
+      'User-Agent': 'MyManga-search-engine/1.0 (+https://moodmanga.in)'
+    }
   });
 
   if (!res.ok) {
@@ -213,7 +219,21 @@ async function mangadexQuery(offset, attempt = 0) {
       await sleep(delay);
       return mangadexQuery(offset, attempt + 1);
     }
-    throw new Error(`MangaDex HTTP ${res.status}`);
+    // FIXED 2026-07-14: previously threw a bare "MangaDex HTTP 400" with no
+    // body, making the failure undiagnosable (same class of bug the
+    // "Harvest failed" generic string was for AniList — see the entry
+    // point's catch block). MangaDex's error responses are JSON with an
+    // `errors` array containing a human-readable `detail` per error; surface
+    // that verbatim so the NEXT failure (if any) is actually diagnosable
+    // instead of requiring guesswork.
+    let detail = '';
+    try {
+      const body = await res.json();
+      detail = (body.errors || []).map((e) => e.detail || e.title).filter(Boolean).join('; ');
+    } catch {
+      // response wasn't JSON (e.g. an HTML error page from an intermediary) — fall through with no detail
+    }
+    throw new Error(`MangaDex HTTP ${res.status}${detail ? `: ${detail}` : ''}`);
   }
 
   return res.json(); // { result, response, data: [...], limit, offset, total }
