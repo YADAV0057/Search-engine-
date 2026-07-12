@@ -1,0 +1,46 @@
+# SAVE AS: .github/workflows/deploy.yml  (repo root — NOT inside engine/)
+#
+# Deploys both Edge Functions (search, harvest-lexicons) any time
+# engine/supabase/functions/** changes on main. Runs entirely on GitHub's
+# own runners, so nothing needs to happen on a local machine — editing
+# files in the GitHub web UI and committing is enough to trigger this.
+#
+# One-time setup before this will work (see chat for the full walkthrough):
+#   1. Repo secret SUPABASE_ACCESS_TOKEN  — Supabase Dashboard > Account > Access Tokens
+#   2. Repo secret SUPABASE_PROJECT_ID    — Supabase Dashboard > Project Settings > General
+#   (Settings > Secrets and variables > Actions, in this GitHub repo)
+#
+# Migrations (engine/supabase/migrations/*.sql) are NOT run by this
+# workflow — those are pasted into the Supabase Dashboard's SQL Editor by
+# hand for now. Function secrets (HARVEST_SECRET, etc.) are also managed
+# in the Dashboard, not here — see engine/.env.example for the full list.
+
+name: Deploy Supabase Edge Functions
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'engine/supabase/functions/**'
+      - 'engine/supabase/config.toml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch: {} # lets you trigger a redeploy manually from the Actions tab, no code change needed
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Deploys every function under engine/supabase/functions/ in one
+      # call (search + harvest-lexicons) — CLI v1.62.0+ supports deploying
+      # the whole functions/ folder without naming each one individually.
+      - name: Deploy Edge Functions
+        working-directory: engine
+        run: supabase functions deploy --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
