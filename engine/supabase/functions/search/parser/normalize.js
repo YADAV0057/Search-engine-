@@ -1,5 +1,3 @@
-// SAVE AS: engine/supabase/functions/search/parser/normalize.js
-
 
 /**
  * Normalize user search text.
@@ -29,4 +27,3 @@ export function normalize(input) {
         .trim();
 
 }
-
