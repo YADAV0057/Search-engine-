@@ -3,7 +3,7 @@
 // supabase/functions/harvest-lexicons/index.ts
 // ==========================================
 // POST /harvest-lexicons   (header: x-harvest-secret: <HARVEST_SECRET>)
-// { "entityTypes": ["genre","tag","staff","character","studio","media","synonym"] }  (optional, default: all)
+// { "entityTypes": ["genre","tag","staff","character","studio","media","media_mangadex","synonym"] }  (optional, default: all)
 // -> { "results": { "genre": { loaded: n }, "staff": { loaded: n, maxId: n }, ..., "synonym": { loaded: n, seeds: n } } }
 //
 // NOT part of the live /search request path — same reasoning the old
@@ -31,6 +31,14 @@
 //   fetched. media is scoped to type: MANGA only (this engine's one live
 //   niche so far, see domains.js) to keep it well under the ~35MB Gemini
 //   estimated for the full anime+manga set.
+// - media_mangadex: second, independent source for media (manga titles)
+//   only, added 2026-07-13 (see project Notion/README changelog). AniList's
+//   media harvest above is left completely untouched — this pages through
+//   MangaDex's own /manga list endpoint separately, offset-checkpointed
+//   (not ID_DESC — MangaDex has no equivalent sequential-ID sort), and
+//   dedupes against lexicon_entities by normalized title before inserting,
+//   so a title AniList already has is never duplicated. See
+//   harvestMediaFromMangaDex() below and 0004_mangadex_media_dedup.sql.
 // - synonym: reads the genre/tag/theme/demographic words already sitting in
 //   lexicon_entities (populated by the static-entity step above — no fresh
 //   AniList calls needed) and, for each, asks Datamuse's free ml= (means-
@@ -76,6 +84,30 @@ const MAX_PAGES_PER_RUN = 200; // hard ceiling (10k rows/entity/run) so a bad sy
 // it as fast as possible. ~450 seed words * 750ms is well under a minute.
 const DATAMUSE_REQUEST_GAP_MS = 750;
 const DATAMUSE_MAX_RESULTS = 8;
+
+// ---- MangaDex (media, second source alongside AniList) ----
+// See harvestMediaFromMangaDex() below for the full decision log.
+
+const MANGADEX_API_URL = 'https://api.mangadex.org/manga';
+
+// MangaDex has no documented hard per-second cap for this endpoint but
+// asks integrators to be reasonable. Same gap as AniList/Datamuse above —
+// consistent, polite, and already proven not to trip anything.
+const MANGADEX_REQUEST_GAP_MS = 750;
+const MANGADEX_PAGE_SIZE = 100; // MangaDex's max limit per page
+
+// MangaDex enforces offset + limit <= 10000 on this endpoint — there is
+// no cursor/ID-based pagination for the public /manga list. This caps a
+// single sync at the 10,000th title in creation order. Revisit (e.g. by
+// running a second pass with a different `order[]` param, such as
+// updatedAt, and deduping against what's already stored) if MangaDex's
+// catalog needs deeper coverage than that — not needed for v1.
+const MANGADEX_MAX_OFFSET = 10000;
+
+// Excludes pornographic content, matching a manga-discovery product's
+// typical default; includes safe/suggestive/erotica. Adjust here if the
+// product's content policy changes — this is the only place it's defined.
+const MANGADEX_CONTENT_RATING = ['safe', 'suggestive', 'erotica'];
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -152,6 +184,63 @@ async function datamuseQuery(word, attempt = 0) {
 
   // Datamuse returns [{ word: "depressed", score: 123456 }, ...]
   return res.json();
+}
+
+/**
+ * MangaDex /manga list query, offset-paginated. Same retry/backoff
+ * approach as anilistQuery() — 429/502/503/504 retried with exponential
+ * backoff, 429 given the longer rate-limit backoff.
+ */
+async function mangadexQuery(offset, attempt = 0) {
+  const params = new URLSearchParams();
+  params.set('limit', String(MANGADEX_PAGE_SIZE));
+  params.set('offset', String(offset));
+  params.set('order[createdAt]', 'asc'); // stable, deterministic across runs — createdAt never changes after the fact, unlike updatedAt
+  for (const rating of MANGADEX_CONTENT_RATING) {
+    params.append('contentRating[]', rating);
+  }
+
+  const res = await fetch(`${MANGADEX_API_URL}?${params.toString()}`, {
+    headers: { 'Accept': 'application/json' }
+  });
+
+  if (!res.ok) {
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+      const isRateLimit = res.status === 429;
+      const baseDelay = isRateLimit ? RATE_LIMIT_BASE_DELAY_MS : RETRY_BASE_DELAY_MS;
+      const delay = baseDelay * Math.pow(2, attempt);
+      console.warn(`MangaDex HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(delay);
+      return mangadexQuery(offset, attempt + 1);
+    }
+    throw new Error(`MangaDex HTTP ${res.status}`);
+  }
+
+  return res.json(); // { result, response, data: [...], limit, offset, total }
+}
+
+/**
+ * Must produce IDENTICAL output to the generated `normalized_name` column
+ * added in 0004_mangadex_media_dedup.sql (lower + strip non-alphanumeric).
+ * If these two ever drift apart, the dedup check silently stops working.
+ */
+function normalizeTitle(name) {
+  return name.toLowerCase().replace(/[^a-z0-9]+/g, '');
+}
+
+/** Prefer English title; fall back to any locale MangaDex provides. */
+function extractMangaDexTitle(manga) {
+  const titles = manga.attributes?.title || {};
+  if (titles.en) return titles.en;
+  const firstLocale = Object.values(titles)[0];
+  if (firstLocale) return firstLocale;
+  // Last resort: altTitles is an array of single-locale objects like the
+  // primary title field, e.g. [{ en: "..." }, { ja: "..." }].
+  for (const alt of manga.attributes?.altTitles || []) {
+    const v = Object.values(alt)[0];
+    if (v) return v;
+  }
+  return null;
 }
 
 // ---- Static entities: genres + tags/themes/demographics ----
@@ -408,9 +497,111 @@ async function harvestPaginated(entityType) {
   return { loaded, maxId: newMaxId, pagesFetched: page };
 }
 
+// ---- MangaDex media (manga titles), second source alongside AniList ----
+//
+// Decision log (2026-07-13, project Notion/README): AniList's media
+// harvest above is left untouched (still ID_DESC, still lastMaxId-
+// checkpointed, still the primary source). This adds an independent
+// second pass over MangaDex's own catalog, deduped by normalized title
+// against whatever's already in lexicon_entities — so a title AniList
+// already has is never inserted twice, but a title only MangaDex has (or
+// vice versa) is kept.
+//
+// Uses the sync-state key "media:mangadex" (a plain string in the same
+// entity_type column lexicon_sync_state already has — no schema change
+// needed there) so its offset checkpoint is completely independent of
+// AniList's "media" row.
+//
+// Requires 0004_mangadex_media_dedup.sql to have been run first — the
+// dedup query below depends on the normalized_name generated column it
+// adds to lexicon_entities.
+
+async function harvestMediaFromMangaDex() {
+  const lastOffset = await getSyncState('media:mangadex');
+  let offset = lastOffset;
+  let loaded = 0;
+  let skippedDuplicates = 0;
+  let total = null;
+  let finished = false;
+
+  while (offset < MANGADEX_MAX_OFFSET) {
+    const data = await mangadexQuery(offset);
+    total = data.total ?? total;
+    const items = data.data || [];
+
+    if (items.length === 0) {
+      finished = true;
+      break;
+    }
+
+    // Extract + normalize this page's titles first, then do ONE batched
+    // existence check against lexicon_entities instead of one query per
+    // item — same "don't do N round trips for N items" reasoning as the
+    // rest of this file's per-page (not per-row) checkpointing.
+    const candidates = [];
+    for (const manga of items) {
+      const title = extractMangaDexTitle(manga);
+      if (!title) continue;
+      candidates.push({ id: manga.id, title, normalized: normalizeTitle(title) });
+    }
+
+    let existingNormalized = new Set();
+    if (candidates.length > 0) {
+      const { data: existing, error } = await supabase
+        .from('lexicon_entities')
+        .select('normalized_name')
+        .eq('entity_type', 'media')
+        .in('normalized_name', candidates.map((c) => c.normalized));
+      if (error) throw error;
+      existingNormalized = new Set((existing || []).map((r) => r.normalized_name));
+    }
+
+    const rows = [];
+    for (const c of candidates) {
+      if (existingNormalized.has(c.normalized)) {
+        skippedDuplicates++;
+        continue;
+      }
+      rows.push({
+        entity_type: 'media',
+        // Prefixed so a MangaDex UUID can never collide with an AniList
+        // numeric id in the same entity_type,source_id unique index.
+        source_id: `mangadex-${c.id}`,
+        name: c.title,
+        metadata: { source: 'mangadex', mangadexId: c.id },
+        updated_at: new Date().toISOString()
+      });
+    }
+
+    if (rows.length > 0) {
+      const { error } = await supabase.from('lexicon_entities').upsert(rows, { onConflict: 'entity_type,source_id' });
+      if (error) throw error;
+      loaded += rows.length;
+    }
+
+    offset += items.length;
+
+    // Checkpoint after every page, same reasoning as harvestPaginated()'s
+    // CHECKPOINTING note — a killed mid-run still makes forward progress.
+    await setSyncState('media:mangadex', offset);
+
+    if (total !== null && offset >= total) {
+      finished = true;
+      break;
+    }
+    await sleep(MANGADEX_REQUEST_GAP_MS);
+  }
+
+  if (!finished && offset >= MANGADEX_MAX_OFFSET) {
+    console.warn(`MangaDex harvest hit the ${MANGADEX_MAX_OFFSET} offset ceiling before reaching the end of the catalog (total: ${total}). Resume point saved; see MANGADEX_MAX_OFFSET comment for why this exists.`);
+  }
+
+  return { loaded, skippedDuplicates, offset, total, finished };
+}
+
 // ---- Entry point ----
 
-const ALL_ENTITY_TYPES = ['genre', 'tag', 'staff', 'character', 'studio', 'media', 'synonym'];
+const ALL_ENTITY_TYPES = ['genre', 'tag', 'staff', 'character', 'studio', 'media', 'media_mangadex', 'synonym'];
 
 Deno.serve(async (req) => {
   if (req.method !== 'POST') {
@@ -443,6 +634,16 @@ Deno.serve(async (req) => {
     for (const entityType of ['staff', 'character', 'studio', 'media']) {
       if (!requested.includes(entityType)) continue;
       results[entityType] = await harvestPaginated(entityType);
+      await sleep(REQUEST_GAP_MS);
+    }
+
+    // Independent second media source — see harvestMediaFromMangaDex()
+    // decision log above. Kept as its own opt-in entity type rather than
+    // folded into the 'media' loop above so it can be triggered on its
+    // own (e.g. via the GitHub Actions workflow_dispatch input) without
+    // re-touching AniList at all.
+    if (requested.includes('media_mangadex')) {
+      results.media_mangadex = await harvestMediaFromMangaDex();
       await sleep(REQUEST_GAP_MS);
     }
 
