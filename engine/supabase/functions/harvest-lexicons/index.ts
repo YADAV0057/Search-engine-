@@ -30,6 +30,18 @@
 //   fetched. media is scoped to type: MANGA only (this engine's one live
 //   niche so far, see domains.js) to keep it well under the ~35MB Gemini
 //   estimated for the full anime+manga set.
+//
+// CHECKPOINTING: Supabase's Free-plan Edge Functions have a 150s request
+// idle timeout — a run against a large, never-before-synced entity type
+// (characters, media) can easily get killed mid-pagination before this
+// function ever reaches its own "return" statement. setSyncState() is
+// therefore called after EVERY page, not just once at the end of the
+// while loop. Rows are already upserted per-page, so without this, a
+// timed-out run would keep its fetched rows but lose the resume point,
+// forcing the next run to re-walk pages it already paid for in nothing
+// but wasted quota/time. With per-page checkpointing, every run — even
+// one that gets killed by the platform mid-flight — makes permanent
+// forward progress.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -216,12 +228,17 @@ async function harvestPaginated(entityType) {
       loaded += rows.length;
     }
 
+    // Checkpoint after every page (not just once at the end) — see the
+    // CHECKPOINTING note at the top of this file. This upsert is cheap
+    // (single row, primary key on entity_type) so doing it PAGE_SIZE-often
+    // instead of once-per-run is not a meaningful cost, and it's what
+    // makes a mid-run 150s timeout non-wasteful.
+    if (newMaxId > lastMaxId) await setSyncState(entityType, newMaxId);
+
     if (!data.Page.pageInfo?.hasNextPage) break;
     page++;
     await sleep(REQUEST_GAP_MS);
   }
-
-  if (newMaxId > lastMaxId) await setSyncState(entityType, newMaxId);
 
   return { loaded, maxId: newMaxId, pagesFetched: page };
 }
