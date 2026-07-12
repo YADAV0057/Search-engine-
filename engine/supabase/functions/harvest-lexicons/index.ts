@@ -63,17 +63,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function anilistQuery(query, variables = {}) {
+async function anilistQuery(query, variables = {})': // Retry config: AniList 502/503/504 are transient upstream blips (their
+// server, not ours — confirmed 2026-07-13 when a 504 hit right at the
+// start of `staff` pagination after genre/tag/theme/demographic had
+// already succeeded). Retry a couple times with exponential backoff
+// before giving up, so a single blip doesn't fail the whole harvest run.
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+const MAX_RETRIES = 2;
+const RETRY_BASE_DELAY_MS = 1000; // 1s, then 2s
+
+async function anilistQuery(query, variables = {}, attempt = 0) {
   const res = await fetch(ANILIST_API_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
     body: JSON.stringify({ query, variables })
   });
-  if (!res.ok) throw new Error(`AniList HTTP ${res.status}`);
+
+  if (!res.ok) {
+    if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      console.warn(`AniList HTTP ${res.status} — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(delay);
+      return anilistQuery(query, variables, attempt + 1);
+    }
+    throw new Error(`AniList HTTP ${res.status}`);
+  }
+
   const data = await res.json();
   if (data.errors) throw new Error(`AniList GraphQL error: ${JSON.stringify(data.errors)}`);
   return data.data;
 }
+
 
 // ---- Static entities: genres + tags/themes/demographics ----
 
