@@ -14,13 +14,17 @@ import { buildPlanFromGenreList } from './parser/searchPlanner.js';
 import { fetchFromAniListUnified } from './adapters/anilist.js';
 import { fetchFromJikanFallback } from './adapters/jikan.js';
 import { fetchFromKitsuFallback } from './adapters/kitsu.js';
+import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 
 // Tiered fallback per README section 2: try source 1, only fall through if
-// it comes back empty. Order here IS the waterfall order.
+// it comes back empty. Order here IS the waterfall order. MangaDex sits
+// last — it's the old engine's Tier 4 database, kept as the final catch-all
+// after the three metadata-first sources.
 const MANGA_SOURCES = [
   { name: 'anilist', fetch: (plan) => fetchFromAniListUnified(plan) },
   { name: 'jikan', fetch: (plan) => fetchFromJikanFallback(plan) },
-  { name: 'kitsu', fetch: (plan) => fetchFromKitsuFallback(plan) }
+  { name: 'kitsu', fetch: (plan) => fetchFromKitsuFallback(plan) },
+  { name: 'mangadex', fetch: (plan) => fetchFromMangaDexFallback(plan) }
 ];
 
 /**
@@ -46,7 +50,7 @@ function buildBasicPlan(query, filters) {
     secondaryThemes: [],
     excludedGenres: filters?.excludedGenres ?? [],
     excludedThemes: [],
-    apiOrder: ['anilist', 'jikan', 'kitsu'],
+    apiOrder: ['anilist', 'jikan', 'kitsu', 'mangadex'],
     filters: {
       status: filters?.status ?? null,
       statusFilter: null,
