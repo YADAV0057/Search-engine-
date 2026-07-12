@@ -1,0 +1,20 @@
+# SAVE AS: engine/supabase/config.toml
+#
+# Minimal on purpose — this project is deployed remotely via GitHub Actions
+# (see .github/workflows/deploy.yml), not run locally with `supabase start`,
+# so none of the local-dev sections (db, studio, inbucket, auth email
+# templates, etc.) are needed here.
+
+project_id = "search-engine"
+
+# Both functions are called by frontends with no Supabase session — access
+# control is CORS (search, via cors.js's allowlist) or a shared secret
+# header (harvest-lexicons, via HARVEST_SECRET), not Supabase Auth. Without
+# verify_jwt = false, Supabase's gateway rejects every request before it
+# ever reaches the function code, since it'd expect a Supabase JWT that
+# these callers don't have.
+[functions.search]
+verify_jwt = false
+
+[functions.harvest-lexicons]
+verify_jwt = false
