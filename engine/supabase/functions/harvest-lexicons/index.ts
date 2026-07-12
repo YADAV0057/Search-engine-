@@ -63,7 +63,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function anilistQuery(query, variables = {})': // Retry config: AniList 502/503/504 are transient upstream blips (their
+
 // server, not ours — confirmed 2026-07-13 when a 504 hit right at the
 // start of `staff` pagination after genre/tag/theme/demographic had
 // already succeeded). Retry a couple times with exponential backoff
