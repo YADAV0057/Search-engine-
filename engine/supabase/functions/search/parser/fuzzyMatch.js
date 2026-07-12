@@ -3,16 +3,24 @@
 // Typo tolerance for the mood/synonym phrase matchers. Those match exact
 // strings, so a misspelling like "rivalery" or "acedemic" never matches
 // "academic rivalry" at all, no matter how close it is. This corrects each
-// word to the nearest known vocabulary word (drawn from every concept id,
-// alias, and urgency modifier already in the dictionary) before anything
-// else runs — synonyms.js and moodEngine.js don't need to know this
-// happened, they just see cleaner input.
+// word to the nearest known vocabulary word before anything else runs —
+// synonyms.js and moodEngine.js don't need to know this happened, they
+// just see cleaner input.
+//
+// CHANGED: vocabulary now also pulls from GENRE_VOCAB/TITLE_VOCAB
+// (dictionary.js), not just MOOD_DICTIONARY/SYNONYM_MAP/URGENCY_MODIFIERS.
+// Those three are still empty stubs (mood dictionary not rebuilt yet — see
+// dictionary.js), so until now correctTypos() had zero words to correct
+// against and was a silent no-op. Genre/title typos ("romnce", "bersek")
+// now correct correctly; mood-phrase typos still won't until the real
+// mood dictionary is ported.
 
-import { MOOD_DICTIONARY, SYNONYM_MAP, URGENCY_MODIFIERS } from './dictionary.js';
+import { MOOD_DICTIONARY, SYNONYM_MAP, URGENCY_MODIFIERS, GENRE_VOCAB, TITLE_VOCAB } from './dictionary.js';
 
 // Built once and cached — walks every dictionary key (which may be
 // multi-word, e.g. "academic rivalry") and adds each individual word to the
-// vocabulary, since correction happens per-word, not per-phrase.
+// vocabulary, since correction happens per-word, not per-phrase. Plain word
+// lists (GENRE_VOCAB/TITLE_VOCAB) are added as-is, one entry per word.
 let VOCAB = null;
 function getVocab() {
     if (VOCAB) return VOCAB;
@@ -24,9 +32,16 @@ function getVocab() {
             });
         });
     };
+    const addList = (list) => {
+        list.forEach(w => {
+            if (w.length >= 3) words.add(w);
+        });
+    };
     addWords(MOOD_DICTIONARY);
     addWords(SYNONYM_MAP);
     addWords(URGENCY_MODIFIERS);
+    addList(GENRE_VOCAB);
+    addList(TITLE_VOCAB);
     VOCAB = words;
     return VOCAB;
 }
@@ -57,36 +72,42 @@ function maxDistanceFor(word) {
     return 3;
 }
 
+/** Corrects a single already-lowercased word against the vocabulary. Returns the word unchanged if no close-enough match exists. */
+function correctWord(word) {
+    const vocab = getVocab();
+    if (word.length < 3 || vocab.has(word)) return word;
+
+    const maxDist = maxDistanceFor(word);
+    let best = null;
+    let bestDist = Infinity;
+
+    for (const candidate of vocab) {
+        if (Math.abs(candidate.length - word.length) > maxDist) continue; // cheap pre-filter
+        const dist = levenshtein(word, candidate);
+        if (dist < bestDist) {
+            bestDist = dist;
+            best = candidate;
+            if (dist === 0) break;
+        }
+    }
+
+    return (best && bestDist <= maxDist) ? best : word;
+}
+
 /**
- * Corrects likely typos word-by-word against the known concept/alias/
- * modifier vocabulary. Words that already match exactly, or that don't
- * have a close-enough vocabulary word, are left untouched — this only
- * ever nudges a near-miss to what it almost certainly meant, it doesn't
- * invent matches out of nothing.
+ * Corrects likely typos word-by-word against the known vocabulary (mood
+ * concepts/aliases/modifiers + genre/title words). Words that already
+ * match exactly, or that don't have a close-enough vocabulary word, are
+ * left untouched — this only ever nudges a near-miss to what it almost
+ * certainly meant, it doesn't invent matches out of nothing.
  */
 export function correctTypos(text) {
     if (!text) return text;
-    const vocab = getVocab();
-    const words = text.split(/\s+/).filter(Boolean);
-
-    return words.map(word => {
-        if (word.length < 3 || vocab.has(word)) return word;
-
-        const maxDist = maxDistanceFor(word);
-        let best = null;
-        let bestDist = Infinity;
-
-        for (const candidate of vocab) {
-            if (Math.abs(candidate.length - word.length) > maxDist) continue; // cheap pre-filter
-            const dist = levenshtein(word, candidate);
-            if (dist < bestDist) {
-                bestDist = dist;
-                best = candidate;
-                if (dist === 0) break;
-            }
-        }
-
-        return (best && bestDist <= maxDist) ? best : word;
-    }).join(' ');
+    return text.split(/\s+/).filter(Boolean).map(correctWord).join(' ');
 }
 
+/** Same correction, but token-in/token-out — for callers already working with a tokenize()'d array (see normalize.js) instead of a raw string. */
+export function correctTokens(tokens) {
+    if (!tokens || tokens.length === 0) return [];
+    return tokens.map(correctWord);
+}
