@@ -111,15 +111,42 @@ function tokenize(text) {
     return text.toLowerCase().replace(/[^a-z0-9'\-\s]/g, ' ').split(/\s+/).filter(Boolean);
 }
 
+// Below this length, a single word from a vocab name is too generic to
+// trust as a match on its own (e.g. "one" from "one piece", "d" from
+// "monkey d luffy") — skipped unless a name has NO word at or above this
+// length, in which case we fall back to using all of its words anyway
+// rather than making that name unmatchable.
+const SIGNIFICANT_WORD_MIN_LEN = 4;
+
+function nameTokens(name) {
+    return name.split(/\s+/).filter(Boolean);
+}
+
 /**
- * Substring match against a category's vocab, not token-by-token — known
- * names are frequently multi-word ("naoki urasawa", "one piece") and would
- * never match if split into individual tokens first.
+ * Bidirectional token-overlap match, replacing a naive "does the full
+ * query string contain the full vocab name" substring check (see sanity
+ * check finding, 2026-07-13): AniList staff/character names are stored in
+ * FULL ("Kentaro Miura"), so a query using just a surname — "berserk by
+ * miura" — never contained the full name as a substring and silently
+ * missed AUTHOR entirely. This instead checks whether ANY significant word
+ * from a vocab name appears as its OWN token in the query, so a partial
+ * name (surname-only, one word of a multi-word title, etc.) still matches.
+ *
+ * Tradeoff, accepted deliberately (user decision 2026-07-13): this can
+ * over-match on common single-word names/titles (e.g. a TITLE entry
+ * literally named "Air" matching any query containing the word "air") —
+ * preferred over the previous false-negative-heavy behavior for this
+ * project's stage. Revisit with a stricter significance/frequency filter
+ * if false positives become a real problem once real vocab volume is in.
  */
-function matchesCategoryPhrase(queryLower, vocabSet) {
+function matchesCategoryPhrase(queryTokenSet, vocabSet) {
     for (const name of vocabSet) {
-        if (name.length < 3) continue; // skip noise-short entries, same floor as fuzzyMatch.js
-        if (queryLower.includes(name)) return name;
+        const tokens = nameTokens(name);
+        const significant = tokens.filter((w) => w.length >= SIGNIFICANT_WORD_MIN_LEN);
+        const candidates = significant.length > 0 ? significant : tokens; // don't make short-word-only names unmatchable
+        for (const word of candidates) {
+            if (queryTokenSet.has(word)) return name;
+        }
     }
     return null;
 }
@@ -137,6 +164,7 @@ export function classifyQuery(query) {
     kickWarm();
     const queryLower = (query || '').toLowerCase().trim();
     const tokens = tokenize(queryLower);
+    const queryTokenSet = new Set(tokens);
 
     const categories = [];
     const matches = {};
@@ -150,7 +178,7 @@ export function classifyQuery(query) {
     for (const category of ['TITLE', 'AUTHOR', 'CHARACTER', 'GENRE', 'TAG']) {
         const vocabSet = vocabByCategory[category];
         if (!vocabSet || vocabSet.size === 0) continue;
-        const matched = matchesCategoryPhrase(queryLower, vocabSet);
+        const matched = matchesCategoryPhrase(queryTokenSet, vocabSet);
         if (matched) {
             categories.push(category);
             matches[category] = matched;
@@ -183,4 +211,3 @@ export function resolveCategories(scores) {
     const maxScore = Math.max(...nonZero.map(([, v]) => v));
     return nonZero.filter(([, v]) => v >= maxScore - TIE_MARGIN).map(([k]) => k);
 }
-
