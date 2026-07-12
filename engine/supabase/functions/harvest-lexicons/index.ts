@@ -314,9 +314,13 @@ Deno.serve(async (req) => {
     }
 
     return json({ results }, 200);
-  } catch (err) {
+} catch (err) {
     console.error('[harvest-lexicons] failed', err);
-    return json({ error: 'Harvest failed', partialResults: results }, 500);
+    return json({
+      error: 'Harvest failed',
+      message: err instanceof Error ? err.message : String(err),
+      partialResults: results
+    }, 500);
   }
 });
 
