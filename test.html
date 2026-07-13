@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>search-engine // mood endpoint console</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+  :root{
+    --bg: #0a0c10;
+    --panel: #10141b;
+    --panel-2: #151a23;
+    --line: #232a36;
+    --text: #e6e9ef;
+    --dim: #8a93a3;
+    --dimmer: #5c6577;
+    --accent: #57e0c4;     /* calm / positive-ish teal, ties to "mood" theme */
+    --accent-dim: #2c6e60;
+    --warn: #ffb454;
+    --bad: #ff6b6b;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --sans: 'Inter', -apple-system, sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans);}
+  body{
+    min-height:100vh;
+    background-image:
+      radial-gradient(circle at 1px 1px, rgba(255,255,255,0.035) 1px, transparent 0);
+    background-size: 28px 28px;
+  }
+
+  .wrap{max-width:920px;margin:0 auto;padding:36px 20px 80px;}
+
+  /* header */
+  .eyebrow{
+    font-family:var(--mono); font-size:12px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent); display:flex; align-items:center; gap:8px; margin-bottom:10px;
+  }
+  .eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--accent);box-shadow:0 0 8px var(--accent);}
+  h1{font-size:22px; font-weight:700; margin:0 0 6px; letter-spacing:-0.01em;}
+  .sub{color:var(--dim); font-size:14px; line-height:1.6; max-width:640px; margin-bottom:28px;}
+  .sub code{font-family:var(--mono); background:var(--panel-2); padding:1px 6px; border-radius:4px; color:var(--accent); font-size:12.5px;}
+
+  .notice{
+    border:1px solid var(--line); background:var(--panel); border-left:3px solid var(--warn);
+    padding:12px 14px; border-radius:6px; font-size:13px; color:var(--dim); line-height:1.6; margin-bottom:28px;
+  }
+  .notice b{color:var(--text);}
+
+  /* panel */
+  .panel{background:var(--panel); border:1px solid var(--line); border-radius:10px; overflow:hidden; margin-bottom:20px;}
+  .panel-head{
+    padding:12px 16px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between;
+    font-family:var(--mono); font-size:11.5px; letter-spacing:.08em; text-transform:uppercase; color:var(--dimmer);
+  }
+  .panel-body{padding:16px;}
+
+  .row{display:flex; gap:10px; margin-bottom:10px;}
+  .row:last-child{margin-bottom:0;}
+  .field{flex:1; display:flex; flex-direction:column; gap:6px;}
+  .field label{font-size:11px; color:var(--dimmer); font-family:var(--mono); letter-spacing:.04em;}
+  input[type=text]{
+    background:#0d1117; border:1px solid var(--line); color:var(--text); font-family:var(--mono);
+    font-size:13.5px; padding:10px 12px; border-radius:6px; outline:none; width:100%;
+    transition:border-color .15s;
+  }
+  input[type=text]:focus{border-color:var(--accent-dim);}
+  .field.grow{flex:2.4;}
+
+  .presets{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
+  .preset-btn{
+    font-family:var(--mono); font-size:11.5px; color:var(--dim); background:var(--panel-2);
+    border:1px solid var(--line); padding:6px 10px; border-radius:20px; cursor:pointer;
+    transition:all .15s;
+  }
+  .preset-btn:hover{border-color:var(--accent-dim); color:var(--text);}
+
+  .actions{display:flex; align-items:center; gap:12px; margin-top:16px;}
+  button.run{
+    font-family:var(--mono); font-weight:600; font-size:13px; letter-spacing:.03em;
+    background:var(--accent); color:#04211b; border:none; padding:11px 20px; border-radius:6px; cursor:pointer;
+    display:flex; align-items:center; gap:8px; transition:filter .15s, transform .1s;
+  }
+  button.run:hover{filter:brightness(1.08);}
+  button.run:active{transform:scale(.98);}
+  button.run:disabled{background:var(--panel-2); color:var(--dimmer); cursor:not-allowed;}
+  .status-line{font-family:var(--mono); font-size:12px; color:var(--dimmer);}
+  .status-line.ok{color:var(--accent);}
+  .status-line.err{color:var(--bad);}
+
+  .spinner{width:13px;height:13px;border-radius:50%;border:2px solid rgba(4,33,27,.35);border-top-color:#04211b;animation:spin .7s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+
+  /* results */
+  .result-card{border:1px solid var(--line); border-radius:10px; background:var(--panel); margin-bottom:14px; overflow:hidden;}
+  .result-top{padding:12px 16px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--line); gap:10px; flex-wrap:wrap;}
+  .result-meta{font-family:var(--mono); font-size:12px; color:var(--dim); display:flex; gap:14px; flex-wrap:wrap;}
+  .badge{
+    font-family:var(--mono); font-size:11px; padding:3px 8px; border-radius:20px; border:1px solid var(--line);
+  }
+  .badge.ok{color:var(--accent); border-color:var(--accent-dim); background:rgba(87,224,196,.08);}
+  .badge.bad{color:var(--bad); border-color:#5c2a2a; background:rgba(255,107,107,.08);}
+
+  .mood-bar{padding:14px 16px; border-bottom:1px solid var(--line); background:var(--panel-2);}
+  .mood-bar-label{font-family:var(--mono); font-size:11px; color:var(--dimmer); text-transform:uppercase; letter-spacing:.08em; margin-bottom:8px;}
+  .mood-chips{display:flex; flex-wrap:wrap; gap:8px;}
+  .mood-chip{
+    font-family:var(--mono); font-size:12px; padding:5px 10px; border-radius:6px;
+    background:#0d1117; border:1px solid var(--line); color:var(--text);
+    display:flex; align-items:center; gap:7px;
+  }
+  .mood-chip .intensity-dot{width:7px;height:7px;border-radius:50%; background:var(--accent);}
+  .mood-empty{font-family:var(--mono); font-size:12px; color:var(--dimmer); font-style:italic;}
+
+  pre.json{
+    margin:0; padding:16px; font-family:var(--mono); font-size:12.5px; line-height:1.6;
+    color:#c3cad6; overflow-x:auto; max-height:420px; overflow-y:auto;
+  }
+  .k{color:#7dd3fc;} .s{color:var(--accent);} .n{color:var(--warn);} .b{color:#c792ea;}
+
+  .empty-state{
+    text-align:center; padding:50px 20px; color:var(--dimmer); font-family:var(--mono); font-size:13px;
+  }
+  .empty-state .glyph{font-size:22px; margin-bottom:10px; opacity:.6;}
+
+  footer{margin-top:28px; font-family:var(--mono); font-size:11px; color:var(--dimmer); text-align:center; line-height:1.8;}
+  footer a{color:var(--dim);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="eyebrow"><span class="dot"></span>search-engine · live console</div>
+  <h1>Mood endpoint test console</h1>
+  <div class="sub">Fires a real <code>POST</code> against the deployed <code>/functions/v1/search</code> Edge Function, straight from your browser, and surfaces the <code>mood</code> field from the response.</div>
+
+  <div class="notice">
+    <b>Why this exists here, not in chat:</b> the assistant's own sandbox has no outbound network access, so it can never fire this POST itself. This page runs entirely in <b>your</b> browser instead — click Run below and it hits the endpoint directly from your machine. If it's blocked, it's almost certainly the function's CORS allowlist rejecting this origin (expected, since only <code>moodmanga.in</code> is allowlisted) — the error message below will say so.
+  </div>
+
+  <div class="panel">
+    <div class="panel-head"><span>request</span><span id="methodTag">POST</span></div>
+    <div class="panel-body">
+      <div class="row">
+        <div class="field grow">
+          <label>endpoint url</label>
+          <input type="text" id="endpoint" value="https://uvperhzhnosjtkwxxnte.supabase.co/functions/v1/search">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field">
+          <label>domain</label>
+          <input type="text" id="domain" value="manga">
+        </div>
+        <div class="field grow">
+          <label>query</label>
+          <input type="text" id="query" value="sad iyashikei">
+        </div>
+      </div>
+      <div class="row">
+        <div class="field grow">
+          <label>anon / api key (Authorization: Bearer …) — optional, only if the function enforces verify_jwt</label>
+          <input type="text" id="apikey" placeholder="leave blank if not required">
+        </div>
+      </div>
+
+      <div class="presets">
+        <div class="preset-btn" data-q="sad iyashikei">sad iyashikei</div>
+        <div class="preset-btn" data-q="devastated heartbroken tragedy">devastated heartbroken tragedy</div>
+        <div class="preset-btn" data-q="wholesome slice of life">wholesome slice of life</div>
+        <div class="preset-btn" data-q="berserk by miura">berserk by miura</div>
+        <div class="preset-btn" data-q="psychological thriller">psychological thriller</div>
+        <div class="preset-btn" data-q="I'm feeling lonely">I'm feeling lonely</div>
+      </div>
+
+      <div class="actions">
+        <button class="run" id="runBtn">▶ run test</button>
+        <span class="status-line" id="statusLine">idle — no request sent yet</span>
+      </div>
+    </div>
+  </div>
+
+  <div id="results"></div>
+
+  <div class="empty-state" id="emptyState">
+    <div class="glyph">◌</div>
+    No requests sent yet. Try a preset above, then hit Run.
+  </div>
+
+  <footer>
+    engine: uvperhzhnosjtkwxxnte.supabase.co &nbsp;·&nbsp; target: /functions/v1/search &nbsp;·&nbsp; expects <code style="color:var(--dimmer)">{ domain, query }</code> → <code style="color:var(--dimmer)">{ results, mood? }</code>
+  </footer>
+</div>
+
+<script>
+  const runBtn = document.getElementById('runBtn');
+  const statusLine = document.getElementById('statusLine');
+  const results = document.getElementById('results');
+  const emptyState = document.getElementById('emptyState');
+  const queryInput = document.getElementById('query');
+  const domainInput = document.getElementById('domain');
+  const endpointInput = document.getElementById('endpoint');
+  const apikeyInput = document.getElementById('apikey');
+
+  document.querySelectorAll('.preset-btn').forEach(btn=>{
+    btn.addEventListener('click', ()=>{ queryInput.value = btn.dataset.q; });
+  });
+
+  function syntaxHighlight(json){
+    const str = JSON.stringify(json, null, 2);
+    return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+      .replace(/("(\\u[a-zA-Z0-9]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+      function(match){
+        let cls = 'n';
+        if(/^"/.test(match)){
+          cls = /:$/.test(match) ? 'k' : 's';
+        } else if(/true|false/.test(match)){
+          cls = 'b';
+        }
+        return '<span class="'+cls+'">'+match+'</span>';
+      });
+  }
+
+  function renderMood(mood){
+    if(!mood){
+      return '<div class="mood-empty">No "mood" field present in this response.</div>';
+    }
+    let chips = '';
+    const agg = mood.aggregate || mood;
+    if(typeof agg === 'object'){
+      for(const [k,v] of Object.entries(agg)){
+        if(typeof v === 'number' || typeof v === 'string'){
+          chips += `<div class="mood-chip"><span class="intensity-dot"></span>${k}: ${v}</div>`;
+        }
+      }
+    }
+    return chips ? `<div class="mood-chips">${chips}</div>` : '<div class="mood-empty">mood field present but empty/unrecognized shape — see raw JSON below.</div>';
+  }
+
+  async function runTest(){
+    const url = endpointInput.value.trim();
+    const domain = domainInput.value.trim();
+    const query = queryInput.value.trim();
+    const key = apikeyInput.value.trim();
+
+    if(!url){ statusLine.textContent = 'error — endpoint URL is empty'; statusLine.className='status-line err'; return; }
+
+    runBtn.disabled = true;
+    runBtn.innerHTML = '<span class="spinner"></span> running…';
+    statusLine.textContent = 'sending POST…';
+    statusLine.className = 'status-line';
+
+    const startedAt = performance.now();
+    const headers = { 'Content-Type': 'application/json' };
+    if(key) headers['Authorization'] = 'Bearer ' + key;
+
+    let card = document.createElement('div');
+    card.className = 'result-card';
+    emptyState.style.display = 'none';
+
+    try{
+      const res = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ domain, query })
+      });
+      const elapsed = Math.round(performance.now() - startedAt);
+      let bodyJson;
+      let rawText = await res.text();
+      try{ bodyJson = JSON.parse(rawText); } catch(e){ bodyJson = { raw: rawText }; }
+
+      const okBadge = res.ok ? `<span class="badge ok">${res.status} OK</span>` : `<span class="badge bad">${res.status} FAILED</span>`;
+
+      card.innerHTML = `
+        <div class="result-top">
+          <div class="result-meta">
+            <span>${okBadge}</span>
+            <span>${elapsed}ms</span>
+            <span>domain: <b style="color:var(--text)">${domain}</b></span>
+            <span>query: <b style="color:var(--text)">"${query}"</b></span>
+          </div>
+        </div>
+        <div class="mood-bar">
+          <div class="mood-bar-label">mood field</div>
+          ${renderMood(bodyJson.mood)}
+        </div>
+        <pre class="json">${syntaxHighlight(bodyJson)}</pre>
+      `;
+
+      statusLine.textContent = res.ok
+        ? `done — ${res.status} in ${elapsed}ms`
+        : `request completed but returned ${res.status}`;
+      statusLine.className = res.ok ? 'status-line ok' : 'status-line err';
+
+    }catch(err){
+      const elapsed = Math.round(performance.now() - startedAt);
+      card.innerHTML = `
+        <div class="result-top">
+          <div class="result-meta">
+            <span class="badge bad">NETWORK / CORS ERROR</span>
+            <span>${elapsed}ms</span>
+            <span>domain: <b style="color:var(--text)">${domain}</b></span>
+            <span>query: <b style="color:var(--text)">"${query}"</b></span>
+          </div>
+        </div>
+        <pre class="json"><span class="s">${err.message}</span>
+
+Likely cause: the Edge Function's CORS allowlist (cors.js) doesn't include this page's origin
+(${location.origin}), so the browser blocked the response before JS could read it.
+This is expected if only moodmanga.in is allowlisted — it's not proof the endpoint itself is down.
+To confirm, temporarily add this origin to the allowlist, or test from an allowlisted origin.</pre>
+      `;
+      statusLine.textContent = 'blocked — see error below';
+      statusLine.className = 'status-line err';
+    }
+
+    results.prepend(card);
+    runBtn.disabled = false;
+    runBtn.innerHTML = '▶ run test';
+  }
+
+  runBtn.addEventListener('click', runTest);
+  queryInput.addEventListener('keydown', e=>{ if(e.key==='Enter') runTest(); });
+</script>
+</body>
+</html>
