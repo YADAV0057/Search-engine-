@@ -123,32 +123,28 @@ function nameTokens(name) {
 }
 
 /**
- * Bidirectional token-overlap match, replacing a naive "does the full
- * query string contain the full vocab name" substring check (see sanity
- * check finding, 2026-07-13): AniList staff/character names are stored in
- * FULL ("Kentaro Miura"), so a query using just a surname — "berserk by
- * miura" — never contained the full name as a substring and silently
- * missed AUTHOR entirely. This instead checks whether ANY significant word
- * from a vocab name appears as its OWN token in the query, so a partial
- * name (surname-only, one word of a multi-word title, etc.) still matches.
+ * Bidirectional token-overlap match — returns EVERY vocab entry that has at
+ * least one significant word overlapping with the query, not just the
+ * first one found. Changed 2026-07-13 (user decision): capping at one
+ * match per category made phrase-category scores inconsistent with
+ * EMOTION, which already counts every matched word — a query with strong
+ * multi-entry TAG signal couldn't out-rank a single stray EMOTION word.
+ * Counting every distinct match makes "more matches = stronger evidence"
+ * apply uniformly across all six categories.
  *
- * Tradeoff, accepted deliberately (user decision 2026-07-13): this can
- * over-match on common single-word names/titles (e.g. a TITLE entry
- * literally named "Air" matching any query containing the word "air") —
- * preferred over the previous false-negative-heavy behavior for this
- * project's stage. Revisit with a stricter significance/frequency filter
- * if false positives become a real problem once real vocab volume is in.
+ * Same tradeoff as before, now just applied per-match instead of per-
+ * category: a single common word can over-match (see note on
+ * SIGNIFICANT_WORD_MIN_LEN above) — accepted for this project's stage.
  */
 function matchesCategoryPhrase(queryTokenSet, vocabSet) {
+    const matched = [];
     for (const name of vocabSet) {
         const tokens = nameTokens(name);
         const significant = tokens.filter((w) => w.length >= SIGNIFICANT_WORD_MIN_LEN);
         const candidates = significant.length > 0 ? significant : tokens; // don't make short-word-only names unmatchable
-        for (const word of candidates) {
-            if (queryTokenSet.has(word)) return name;
-        }
+        if (candidates.some((word) => queryTokenSet.has(word))) matched.push(name);
     }
-    return null;
+    return matched;
 }
 
 /**
@@ -179,10 +175,10 @@ export function classifyQuery(query) {
         const vocabSet = vocabByCategory[category];
         if (!vocabSet || vocabSet.size === 0) continue;
         const matched = matchesCategoryPhrase(queryTokenSet, vocabSet);
-        if (matched) {
+        if (matched.length > 0) {
             categories.push(category);
             matches[category] = matched;
-            scores[category] += 1;
+            scores[category] += matched.length;
         }
     }
 
@@ -198,16 +194,20 @@ export function classifyQuery(query) {
 }
 
 /**
- * Step 2: Rule Engine (§4 of the design doc) — picks the winning
- * category(ies) by highest score. Ties combine, matching "pick the
- * highest score or combine them" from the design. TIE_MARGIN is 0 (exact
- * ties only) for now — widen it later if real query volume shows close-
- * but-not-equal scores should also combine.
+ * Step 2: Rule Engine (§4 of the design doc) — ranks every category that
+ * matched, highest score first, rather than picking a single "winner".
+ * Changed 2026-07-13 (user decision): since results are shown across
+ * multiple categories at once rather than committing to one, there's no
+ * need to collapse near-ties or drop lower-scoring categories — the caller
+ * can decide how many ranks deep to actually use (e.g. show TITLE+AUTHOR
+ * results before GENRE results, rather than only ever showing the top
+ * category).
+ * @param {Record<string, number>} scores
+ * @returns {{ category: string, score: number }[]} sorted highest first
  */
-const TIE_MARGIN = 0;
-export function resolveCategories(scores) {
-    const nonZero = Object.entries(scores).filter(([, v]) => v > 0);
-    if (nonZero.length === 0) return [];
-    const maxScore = Math.max(...nonZero.map(([, v]) => v));
-    return nonZero.filter(([, v]) => v >= maxScore - TIE_MARGIN).map(([k]) => k);
+export function rankCategories(scores) {
+    return Object.entries(scores)
+        .filter(([, v]) => v > 0)
+        .sort((a, b) => b[1] - a[1])
+        .map(([category, score]) => ({ category, score }));
 }
