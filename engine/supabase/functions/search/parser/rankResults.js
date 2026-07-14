@@ -21,6 +21,14 @@
 // Added one small additive export, similarity(a, b), to fuzzyMatch.js
 // itself (reuses the same levenshtein(), changes nothing else) rather than
 // duplicating edit-distance logic here.
+//
+// FIXED 2026-07-14 (this pass): textMatchScore() was calling .toLowerCase()
+// directly on candidate.title, but every adapter (anilist.js/jikan.js/
+// kitsu.js/mangadex.js) returns title as an OBJECT ({ romaji, english }),
+// never a plain string. That threw a TypeError inside rankResults(), which
+// runs inside domains.js's per-source try/catch — so every source failed
+// identically and every search returned results:[], source:null. Fixed by
+// pulling the actual string fields out of the title object before use.
 
 import { similarity } from './fuzzyMatch.js';
 
@@ -86,10 +94,6 @@ function computeRankingWeights(classifierRanked, moodAggregate) {
 
 /**
  * 0–1 intensity from a mood aggregate object, e.g. {sadness: 3, hope: 4} -> 0.7.
- * Same "intensity as multiplier downstream" idea flagged in §10's original
- * Mood Analyzer proposal — just applied here at the ranking stage instead of
- * inside moodLexicon.js itself, since moodLexicon.js's job stays "what mood
- * is this" and rankResults.js's job is "how much should that mood matter".
  */
 function computeMoodIntensity(moodAggregate) {
   if (!moodAggregate) return 0;
@@ -98,17 +102,22 @@ function computeMoodIntensity(moodAggregate) {
 }
 
 /**
- * textMatch sub-score, 0–1. Uses fuzzyMatch.js's similarity(), confirmed
- * against the live file (added there as a small additive export — see
- * that file's own changelog comment). Note this is a different use of
- * fuzzyMatch.js than its existing job: correctTypos()/correctTokens()
- * correct query words against a global vocab Set before search even runs;
- * this instead compares the (already-corrected) query tokens directly
- * against one specific candidate's fields, at ranking time.
+ * textMatch sub-score, 0–1. Uses fuzzyMatch.js's similarity().
+ *
+ * FIXED: candidate.title is { romaji, english }, not a string — pull the
+ * actual text fields out before calling similarity() on them. author/
+ * character are left as-is (candidate.author, candidate.character) since
+ * no adapter currently sets those as objects, but they're optional-chained
+ * defensively anyway.
  */
 function textMatchScore(candidate, queryTokens) {
   if (queryTokens.length === 0) return 0;
-  const fields = [candidate.title, candidate.author, candidate.character].filter(Boolean);
+  const fields = [
+    candidate.title?.english,
+    candidate.title?.romaji,
+    candidate.author,
+    candidate.character
+  ].filter(Boolean);
   let best = 0;
   for (const field of fields) {
     const fieldNorm = field.toLowerCase();
@@ -122,8 +131,7 @@ function textMatchScore(candidate, queryTokens) {
 
 /**
  * genreMatch sub-score, 0–1: fraction of the query's genre/tag terms present
- * in the candidate's genres. Plain overlap, same spirit as
- * matchesCategoryPhrase()'s vocab matching in queryClassifier.js.
+ * in the candidate's genres.
  */
 function genreMatchScore(candidate, queryGenreTerms) {
   if (!queryGenreTerms || queryGenreTerms.length === 0) return 0;
@@ -134,9 +142,7 @@ function genreMatchScore(candidate, queryGenreTerms) {
 
 /**
  * emotionMatch sub-score, 0–1: overlap between the query's mood-driven
- * boost genres (getRoutingForMood(), already built for applyMoodBoost())
- * and the candidate's genres — normalized instead of the raw summed-weight
- * count applyMoodBoost() uses, so it's comparable to the other sub-scores.
+ * boost genres and the candidate's genres.
  */
 function emotionMatchScore(candidate, boostGenres) {
   if (!boostGenres || boostGenres.length === 0) return 0;
@@ -152,9 +158,7 @@ function emotionMatchScore(candidate, boostGenres) {
 
 /**
  * popularity sub-score, 0–1: log-scaled, min-max normalized WITHIN the
- * current result set (not against some global constant) — avoids a single
- * mega-popular title (e.g. a top-10 AniList entry) flattening every other
- * candidate's score to near-zero by comparison.
+ * current result set.
  */
 function computePopularityScores(results) {
   const logPops = results.map((r) => Math.log((r.popularity || 0) + 1));
@@ -167,13 +171,6 @@ function computePopularityScores(results) {
 /**
  * Main entry point. Call after applyMoodBoost()'s hard-filter/soft-rerank
  * step, immediately before returning `results` to the client.
- *
- * @param results        array of candidate manga objects (post genre-exclude filter)
- * @param classifierRanked  output of rankCategories() for this query
- * @param moodAggregate  output of analyzeQueryMood() for this query
- * @param queryTokens    normalized query tokens (for textMatch)
- * @param queryGenreTerms  genre/tag terms extracted from the query (for genreMatch)
- * @param boostGenres    getRoutingForMood(moodAggregate).boostGenres (for emotionMatch)
  */
 function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, boostGenres }) {
   const weights = computeRankingWeights(classifierRanked, moodAggregate);
