@@ -1,213 +1,214 @@
 // SAVE AS: engine/supabase/functions/search/parser/queryClassifier.js
 //
-// Step 1 of the Mood Analyzer pipeline (see project Notion §10): classifies
-// a raw query into one or more non-exclusive categories — TITLE, AUTHOR,
-// CHARACTER, GENRE, TAG, EMOTION — feeding into the Rule Engine (step 2,
-// resolveCategories() below) which scores and picks/combines a winner.
+// Step 1 of the Mood Analyzer pipeline (project log §10): classifies a
+// raw query into one or more non-exclusive categories — TITLE, AUTHOR,
+// CHARACTER, GENRE, TAG, EMOTION — then Step 2 (the "Rule Engine") ranks
+// every category that matched by score, highest first. Results are shown
+// across multiple categories at once rather than committing to a single
+// winner (2026-07-13 design decision — rankCategories() below replaces an
+// earlier tie-picking resolveCategories() approach).
 //
-// REUSES EXISTING VOCAB rather than inventing anything new, per user
-// decision 2026-07-13:
-// - TITLE/AUTHOR/CHARACTER/GENRE/TAG: lexicon_entities (same table
-//   fuzzyMatch.js already reads), mapped from entity_type -> category.
-//   Loading pattern (paginated fetch, in-memory Set cache, 6h refresh,
-//   background warm-on-first-use) is copied from fuzzyMatch.js's
-//   warmVocab()/getVocab() rather than reimplemented differently.
-// - EMOTION: AFINN-165 word-sentiment lookup via lexicon.js's
-//   getWordData() — the same function synopsisAnalyzer.js already uses.
-//   No separate emotion word list needed; if AFINN has an opinion on a
-//   word, that's an emotion signal.
+// TITLE/AUTHOR/CHARACTER/GENRE/TAG reuse the vocab already harvested into
+// lexicon_entities (same table fuzzyMatch.js reads), via a category ->
+// entity_type map below (TAG folds tag+theme+demographic into one
+// category — AniList's 3-way split is meaningful to the harvester, not to
+// a query classifier). EMOTION reuses the live AFINN-165 wordlist
+// (parser/dictionary/afinn.js's getAfinnScore()) — no separate emotion
+// word list.
 //
-// NOTE on coverage: AUTHOR (staff) and CHARACTER harvests are still
-// rate-limited/stalled per the project changelog (AniList 429s), so those
-// two categories will under-match until that harvest catches up. This is
-// expected, not a bug in this file — see context log §8 changelog entries
-// on the staff harvest.
+// Vocab loading (paginated fetch + in-memory cache + 6h refresh +
+// background warm-on-first-use) mirrors the same pattern fuzzyMatch.js and
+// synonyms.js use elsewhere in this codebase. Reimplemented here (not
+// imported) since these parser files don't share module-level state
+// across files in this engine's layout.
+//
+// Known limitation carried over from the design log: AUTHOR/CHARACTER
+// will under-match until the stalled staff/character AniList harvest (see
+// harvest-lexicons changelog, 429 rate-limiting) catches up — not a bug in
+// this file, just thin upstream data.
 
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
-import { getWordData } from './dictionary/lexicon.js';
+import { getAfinnScore } from './dictionary/afinn.js';
+import { normalizeAndTokenize } from './normalize.js';
 
-const supabase = (Deno.env.get('SUPABASE_URL') && Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'))
-    ? createClient(Deno.env.get('SUPABASE_URL'), Deno.env.get('SUPABASE_SERVICE_ROLE_KEY'))
-    : null;
+const CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6h
+const PAGE_SIZE = 1000;
 
-// Classifier category -> lexicon_entities.entity_type value(s).
-// TAG folds tag/theme/demographic together, matching how the Query
-// Classifier design doc treats them as one bucket (a query can independently
-// also hit GENRE — AniList keeps genre and tag/theme/demographic separate,
-// see harvest-lexicons' harvestStatic()).
+// Skips noise words like "one"/"d" that would otherwise token-overlap-match
+// almost anything — same threshold chosen during the 2026-07-13 sanity-check
+// fix below.
+const MIN_SIGNIFICANT_WORD_LENGTH = 4;
+
 const CATEGORY_ENTITY_TYPES = {
-    TITLE: ['media'],
-    AUTHOR: ['staff'],
-    CHARACTER: ['character'],
-    GENRE: ['genre'],
-    TAG: ['tag', 'theme', 'demographic']
+  TITLE: ['media'],
+  AUTHOR: ['staff'],
+  CHARACTER: ['character'],
+  GENRE: ['genre'],
+  TAG: ['tag', 'theme', 'demographic']
 };
 
-const DB_PAGE_SIZE = 1000; // PostgREST's per-request row cap, same as fuzzyMatch.js
-const DB_REFRESH_MS = 6 * 60 * 60 * 1000; // 6h — same TTL as fuzzyMatch.js/domains.js manga cache, no reason to diverge
+let cache = null; // Map<category, Array<{ name: string, tokens: string[] }>>
+let cacheLoadedAt = 0;
+let warmingPromise = null;
 
-// category -> Set<lowercased known name>
-let vocabByCategory = {};
-let loadedAt = 0;
-let loadInFlight = null;
-
-async function fetchAllNames(entityType) {
-    const names = [];
-    let from = 0;
-    while (true) {
-        const { data, error } = await supabase
-            .from('lexicon_entities')
-            .select('name')
-            .eq('entity_type', entityType)
-            .range(from, from + DB_PAGE_SIZE - 1);
-        if (error) throw error;
-        if (!data || data.length === 0) break;
-        for (const row of data) if (row.name) names.push(row.name);
-        if (data.length < DB_PAGE_SIZE) break; // short page = last page
-        from += DB_PAGE_SIZE;
-    }
-    return names;
+function significantTokens(name) {
+  return normalizeAndTokenize(name).filter((t) => t.length >= MIN_SIGNIFICANT_WORD_LENGTH);
 }
 
-async function loadVocabNow() {
-    const result = {};
-    for (const [category, entityTypes] of Object.entries(CATEGORY_ENTITY_TYPES)) {
-        const set = new Set();
-        for (const entityType of entityTypes) {
-            const names = await fetchAllNames(entityType);
-            names.forEach((n) => set.add(String(n).toLowerCase()));
-        }
-        result[category] = set;
+async function loadEntityType(supabase, entityType) {
+  const rows = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('lexicon_entities')
+      .select('name')
+      .eq('entity_type', entityType)
+      .range(from, from + PAGE_SIZE - 1);
+
+    if (error) {
+      console.error(`[queryClassifier] warm fetch error for entity_type=${entityType}`, error);
+      break;
     }
-    vocabByCategory = result;
-    loadedAt = Date.now();
+    if (!data || data.length === 0) break;
+
+    for (const row of data) {
+      if (!row.name) continue;
+      rows.push({ name: row.name, tokens: significantTokens(row.name) });
+    }
+
+    if (data.length < PAGE_SIZE) break;
+    from += PAGE_SIZE;
+  }
+
+  return rows;
+}
+
+async function loadAllCategories(supabase) {
+  const map = new Map();
+
+  for (const [category, entityTypes] of Object.entries(CATEGORY_ENTITY_TYPES)) {
+    const entries = [];
+    for (const entityType of entityTypes) {
+      entries.push(...(await loadEntityType(supabase, entityType)));
+    }
+    map.set(category, entries);
+  }
+
+  return map;
 }
 
 /**
- * Triggers a refresh of the category vocab from lexicon_entities. Safe to
- * call repeatedly — an in-flight load is reused, a fresh-enough cache is a
- * no-op unless forced. Same contract as fuzzyMatch.js's warmVocab().
+ * Ensures the in-memory vocab cache is populated and fresh. Safe to call
+ * every request — a stale-but-present cache is served immediately while a
+ * refresh happens in the background, same pattern as synonyms.js's
+ * warmCache().
  */
-export async function warmClassifierVocab({ force = false } = {}) {
-    if (!supabase) return; // no DB configured — classifier runs EMOTION-only
-    const stale = Date.now() - loadedAt > DB_REFRESH_MS;
-    if (!force && loadedAt > 0 && !stale) return;
-    if (!loadInFlight) {
-        loadInFlight = loadVocabNow()
-            .catch((err) => console.error('[queryClassifier] vocab load failed', err))
-            .finally(() => { loadInFlight = null; });
-    }
-    await loadInFlight;
-}
+async function warmCache(supabase) {
+  const isStale = !cache || (Date.now() - cacheLoadedAt) > CACHE_TTL_MS;
+  if (!isStale) return cache;
 
-let warmKicked = false;
-function kickWarm() {
-    if (warmKicked) return;
-    warmKicked = true;
-    warmClassifierVocab().catch(() => {}); // errors already logged inside warmClassifierVocab
-}
+  if (!warmingPromise) {
+    warmingPromise = loadAllCategories(supabase)
+      .then((map) => {
+        cache = map;
+        cacheLoadedAt = Date.now();
+        warmingPromise = null;
+        return cache;
+      })
+      .catch((err) => {
+        warmingPromise = null;
+        throw err;
+      });
+  }
 
-function tokenize(text) {
-    return text.toLowerCase().replace(/[^a-z0-9'\-\s]/g, ' ').split(/\s+/).filter(Boolean);
-}
-
-// Below this length, a single word from a vocab name is too generic to
-// trust as a match on its own (e.g. "one" from "one piece", "d" from
-// "monkey d luffy") — skipped unless a name has NO word at or above this
-// length, in which case we fall back to using all of its words anyway
-// rather than making that name unmatchable.
-const SIGNIFICANT_WORD_MIN_LEN = 4;
-
-function nameTokens(name) {
-    return name.split(/\s+/).filter(Boolean);
+  if (cache) return cache;
+  return warmingPromise;
 }
 
 /**
- * Bidirectional token-overlap match — returns EVERY vocab entry that has at
- * least one significant word overlapping with the query, not just the
- * first one found. Changed 2026-07-13 (user decision): capping at one
- * match per category made phrase-category scores inconsistent with
- * EMOTION, which already counts every matched word — a query with strong
- * multi-entry TAG signal couldn't out-rank a single stray EMOTION word.
- * Counting every distinct match makes "more matches = stronger evidence"
- * apply uniformly across all six categories.
+ * Bidirectional token-overlap match: true if ANY significant word (>=4
+ * letters) from a vocab entry's name appears as its own token in the
+ * query. Replaces an earlier naive full-string substring match, which
+ * failed on queries like "berserk by miura" against a staff name stored
+ * as "Kentaro Miura" — a surname-only query never contains the full
+ * stored name as a substring (2026-07-13 sanity-check fix).
  *
- * Same tradeoff as before, now just applied per-match instead of per-
- * category: a single common word can over-match (see note on
- * SIGNIFICANT_WORD_MIN_LEN above) — accepted for this project's stage.
+ * Accepted tradeoff, logged rather than re-litigated: this can over-match
+ * on common single-word names/titles (e.g. a title literally named "Air"
+ * matching any query containing "air"). Preferred over the prior
+ * false-negative-heavy behavior at this stage; revisit with a stricter
+ * filter if real query volume shows false positives.
  */
-function matchesCategoryPhrase(queryTokenSet, vocabSet) {
-    const matched = [];
-    for (const name of vocabSet) {
-        const tokens = nameTokens(name);
-        const significant = tokens.filter((w) => w.length >= SIGNIFICANT_WORD_MIN_LEN);
-        const candidates = significant.length > 0 ? significant : tokens; // don't make short-word-only names unmatchable
-        if (candidates.some((word) => queryTokenSet.has(word))) matched.push(name);
+function matchesCategoryPhrase(queryTokenSet, vocabEntries) {
+  const matches = [];
+  for (const entry of vocabEntries) {
+    if (entry.tokens.some((t) => queryTokenSet.has(t))) {
+      matches.push(entry.name);
     }
-    return matched;
+  }
+  return matches;
 }
 
 /**
- * Step 1: Query Classifier.
- * @param {string} query  Raw user query
- * @returns {{
- *   categories: string[],                        // e.g. ["TITLE", "AUTHOR"]
- *   matches: Record<string, string|string[]>,     // what actually matched per category
- *   scores: Record<string, number>                // additive scores, feed into resolveCategories()
- * }}
+ * EMOTION scoring: every query token with a nonzero AFINN score counts,
+ * uncapped — matches the "scoring uncapped" fix applied to the phrase
+ * categories below, so EMOTION doesn't structurally win ties just because
+ * phrase categories used to cap at 1 match regardless of how many vocab
+ * entries actually matched.
  */
-export function classifyQuery(query) {
-    kickWarm();
-    const queryLower = (query || '').toLowerCase().trim();
-    const tokens = tokenize(queryLower);
-    const queryTokenSet = new Set(tokens);
-
-    const categories = [];
-    const matches = {};
-    const scores = { TITLE: 0, AUTHOR: 0, CHARACTER: 0, GENRE: 0, TAG: 0, EMOTION: 0 };
-
-    // --- Phrase-based categories, reusing lexicon_entities vocab ---
-    // On a cold instance before the first warm completes, vocabByCategory
-    // is still empty — this quietly no-ops for these categories rather
-    // than throwing, same graceful-degrade approach as fuzzyMatch.js's
-    // bootstrap-vocab fallback.
-    for (const category of ['TITLE', 'AUTHOR', 'CHARACTER', 'GENRE', 'TAG']) {
-        const vocabSet = vocabByCategory[category];
-        if (!vocabSet || vocabSet.size === 0) continue;
-        const matched = matchesCategoryPhrase(queryTokenSet, vocabSet);
-        if (matched.length > 0) {
-            categories.push(category);
-            matches[category] = matched;
-            scores[category] += matched.length;
-        }
-    }
-
-    // --- EMOTION, via AFINN-165 (lexicon.js) — same lookup synopsisAnalyzer.js uses ---
-    const emotionWords = tokens.filter((token) => getWordData(token));
-    if (emotionWords.length > 0) {
-        categories.push('EMOTION');
-        matches.EMOTION = emotionWords;
-        scores.EMOTION += emotionWords.length;
-    }
-
-    return { categories, matches, scores };
+function scoreEmotion(queryTokens) {
+  const matches = [];
+  for (const token of queryTokens) {
+    const score = getAfinnScore(token);
+    if (score !== null && score !== 0) matches.push(token);
+  }
+  return matches;
 }
 
 /**
- * Step 2: Rule Engine (§4 of the design doc) — ranks every category that
- * matched, highest score first, rather than picking a single "winner".
- * Changed 2026-07-13 (user decision): since results are shown across
- * multiple categories at once rather than committing to one, there's no
- * need to collapse near-ties or drop lower-scoring categories — the caller
- * can decide how many ranks deep to actually use (e.g. show TITLE+AUTHOR
- * results before GENRE results, rather than only ever showing the top
- * category).
- * @param {Record<string, number>} scores
- * @returns {{ category: string, score: number }[]} sorted highest first
+ * Classifies a raw query string into every category it matches, each with
+ * a score = count of distinct matching vocab entries/words — NOT capped
+ * at 1 (2026-07-13 "scoring uncapped" decision: matchesCategoryPhrase()
+ * returns every matching vocab entry per category, not just the first, so
+ * e.g. "psychological tragedy" scores TAG(2) rather than TAG(1)).
+ *
+ * Returns: { [category]: { score: number, matches: string[] } } — only
+ * categories with score > 0 are included; a zero-score category is
+ * omitted entirely rather than present at score 0.
+ */
+export async function classifyQuery(supabase, rawQuery) {
+  const queryTokens = normalizeAndTokenize(rawQuery || '');
+  if (queryTokens.length === 0) return {};
+
+  const queryTokenSet = new Set(queryTokens);
+  const vocabByCategory = await warmCache(supabase);
+
+  const scores = {};
+
+  for (const [category, entries] of vocabByCategory.entries()) {
+    const matches = matchesCategoryPhrase(queryTokenSet, entries);
+    if (matches.length > 0) {
+      scores[category] = { score: matches.length, matches };
+    }
+  }
+
+  const emotionMatches = scoreEmotion(queryTokens);
+  if (emotionMatches.length > 0) {
+    scores.EMOTION = { score: emotionMatches.length, matches: emotionMatches };
+  }
+
+  return scores;
+}
+
+/**
+ * Rule Engine (Step 2): sorts every category that matched by score,
+ * highest first, and returns the full ranked list — NOT a single
+ * tie-picked winner (2026-07-13 redesign: results are shown across
+ * multiple categories at once, so the caller decides how many ranks deep
+ * to surface rather than this function deciding for them).
  */
 export function rankCategories(scores) {
-    return Object.entries(scores)
-        .filter(([, v]) => v > 0)
-        .sort((a, b) => b[1] - a[1])
-        .map(([category, score]) => ({ category, score }));
+  return Object.entries(scores)
+    .map(([category, { score }]) => ({ category, score }))
+    .sort((a, b) => b.score - a.score);
 }
