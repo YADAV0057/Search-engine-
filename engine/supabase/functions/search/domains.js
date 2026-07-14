@@ -7,13 +7,11 @@ import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
-// TODO: confirm this import against the real, live queryClassifier.js before
-// deploying — not yet uploaded/verified this session, so classifyQuery()'s
-// actual export name and return shape are ASSUMED here based on the design
-// log (§10: rankCategories() returns [{category, score}, ...]), not
-// confirmed against real code. Same category of mistake already caught once
-// this session with fuzzyMatch.js — don't skip verifying this one too.
-import { classifyQuery } from './parser/queryClassifier.js';
+// Confirmed against the real, live queryClassifier.js (2026-07-14).
+// classifyQuery(supabase, rawQuery) returns { [category]: { score, matches } }
+// — NOT a ranked list by itself. rankCategories(scores) is the separate
+// step that turns it into [{category, score}, ...] sorted highest-first.
+import { classifyQuery, rankCategories } from './parser/queryClassifier.js';
 
 const MANGA_SOURCES = [
   { name: 'anilist', fetch: (plan) => fetchFromAniListUnified(plan) },
@@ -86,20 +84,26 @@ function applyMoodBoost(results, boostGenres) {
   return scored.map((s) => s.result);
 }
 
-// Wraps classifyQuery() with the same defensive try/catch pattern
-// computeMoodSignal() already uses above — a classifier failure (or a
-// missing/misconfigured supabase client) should degrade to "no classifier
+// Wraps classifyQuery()+rankCategories() with the same defensive try/catch
+// pattern computeMoodSignal() already uses above — a classifier failure (or
+// a missing/misconfigured supabase client) should degrade to "no classifier
 // signal" rather than take down the whole request. rankResults() already
 // has its own zero-signal fallback (even 1/3 split), so this is safe.
+//
+// queryGenreTerms are pulled from scores.GENRE.matches / scores.TAG.matches
+// — these are real matched vocab NAMES from lexicon_entities (e.g. "Romance",
+// "Slice of Life"), not raw query words, which is what rankResults()'s
+// genreMatch scoring needs to compare against each candidate's genres[].
 async function computeQueryClassification(supabase, rawQuery) {
   if (!supabase || !rawQuery) return { ranked: [], genreTerms: [] };
   try {
-    // ASSUMED SHAPE, not confirmed — see the import comment above. If the
-    // real classifyQuery() returns something different (e.g. doesn't
-    // include matched GENRE/TAG term strings alongside the ranked
-    // category/score list), this destructure needs to change to match.
-    const { ranked, genreTerms } = await classifyQuery(supabase, rawQuery);
-    return { ranked: ranked || [], genreTerms: genreTerms || [] };
+    const scores = await classifyQuery(supabase, rawQuery);
+    const ranked = rankCategories(scores);
+    const genreTerms = [
+      ...(scores.GENRE ? scores.GENRE.matches : []),
+      ...(scores.TAG ? scores.TAG.matches : [])
+    ];
+    return { ranked, genreTerms };
   } catch (err) {
     console.error('[domains] query classification failed', err);
     return { ranked: [], genreTerms: [] };
