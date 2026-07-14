@@ -4,6 +4,6 @@ const AFINN_SCORES = {
 
 export function getAfinnScore(word) {
   if (!word) return null;
-  const score = AFINN_SCORES[word.toLowerCase()];
+  const score = AFINN_SCORES[word.toLowerCase()]; 
   return typeof score === 'number' ? score : null;
 }
