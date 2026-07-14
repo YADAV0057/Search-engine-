@@ -62,7 +62,7 @@ Deno.serve(async (req) => {
       return json({ results: cached, cached: true, source: 'cache' }, 200, cors);
     }
 
-    const { source, results } = await handler.run({ query, filters });
+    const { source, results, mood } = await handler.run({ query, filters, supabase });
 
     // Only cache non-empty results — an empty result set is more likely a
     // transient upstream hiccup than a stable "nothing exists" answer, and
