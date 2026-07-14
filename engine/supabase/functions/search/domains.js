@@ -13,12 +13,28 @@ import { rankResults } from './parser/rankResults.js';
 // step that turns it into [{category, score}, ...] sorted highest-first.
 import { classifyQuery, rankCategories } from './parser/queryClassifier.js';
 
+const DEFAULT_PAGE = 1;
+const DEFAULT_LIMIT = 10;
+const MAX_LIMIT = 25; // Jikan hard-caps at 25/page — keep every source consistent
+
 const MANGA_SOURCES = [
-  { name: 'anilist', fetch: (plan) => fetchFromAniListUnified(plan) },
-  { name: 'jikan', fetch: (plan) => fetchFromJikanFallback(plan) },
-  { name: 'kitsu', fetch: (plan) => fetchFromKitsuFallback(plan) },
-  { name: 'mangadex', fetch: (plan) => fetchFromMangaDexFallback(plan) }
+  { name: 'anilist', fetch: (plan, page, limit) => fetchFromAniListUnified(plan, page, false, limit) },
+  { name: 'jikan', fetch: (plan, page, limit) => fetchFromJikanFallback(plan, page, limit) },
+  { name: 'kitsu', fetch: (plan, page, limit) => fetchFromKitsuFallback(plan, page, limit) },
+  { name: 'mangadex', fetch: (plan, page, limit) => fetchFromMangaDexFallback(plan, page, limit) }
 ];
+
+// filters.page / filters.perPage are the new caller-facing pagination
+// params. Both optional — default to page 1 / 10 results, same as the
+// old hardcoded adapter defaults, so existing callers with no pagination
+// awareness see zero behavior change.
+function resolvePagination(filters) {
+  const rawPage = Number(filters?.page);
+  const rawLimit = Number(filters?.perPage);
+  const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : DEFAULT_PAGE;
+  const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
+  return { page, limit };
+}
 
 function buildBasicPlan(query, filters) {
   if (Array.isArray(filters?.genres) && filters.genres.length > 0) {
