@@ -59,9 +59,10 @@ Deno.serve(async (req) => {
 
     const cached = await getCached(supabase, domain, cacheKey);
     if (cached) {
-      return json({ results, cached: false, source, mood }, 200, cors);
+  return json({ results: cached, cached: true, source: 'cache' }, 200, cors);
+}
 
-    const { source, results, mood } = await handler.run({ query, filters, supabase });
+const { source, results, mood } = await handler.run({ query, filters, supabase });
 
     // Only cache non-empty results — an empty result set is more likely a
     // transient upstream hiccup than a stable "nothing exists" answer, and
@@ -70,7 +71,7 @@ Deno.serve(async (req) => {
       await setCached(supabase, domain, cacheKey, results, handler.ttlSeconds);
     }
 
-    return json({ results, cached: false, source }, 200, cors);
+    return json({ results, cached: false, source, mood }, 200, cors);
   } catch (err) {
     console.error(`[search] domain="${domain}" failed`, err);
     return json({ error: 'Internal search error' }, 500, cors);
