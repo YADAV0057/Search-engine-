@@ -13,21 +13,23 @@ import { rankResults } from './parser/rankResults.js';
 // step that turns it into [{category, score}, ...] sorted highest-first.
 import { classifyQuery, rankCategories } from './parser/queryClassifier.js';
 
+// ==========================================
+// PAGINATION — added 2026-07-14 (Notion "wiring search engine" Entry 18)
+// ==========================================
+// Root cause: runManga() never passed page/limit to any adapter, so every
+// search was hardcoded to the first 10 results regardless of what a caller
+// asked for. All 4 adapters already accepted (plan, page, limit) params —
+// domains.js just wasn't supplying them. This is additive: a caller that
+// sends no filters.page/perPage gets the exact same behavior as before
+// (page 1, 10 results).
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25; // Jikan hard-caps at 25/page — keep every source consistent
 
-const MANGA_SOURCES = [
-  { name: 'anilist', fetch: (plan, page, limit) => fetchFromAniListUnified(plan, page, false, limit) },
-  { name: 'jikan', fetch: (plan, page, limit) => fetchFromJikanFallback(plan, page, limit) },
-  { name: 'kitsu', fetch: (plan, page, limit) => fetchFromKitsuFallback(plan, page, limit) },
-  { name: 'mangadex', fetch: (plan, page, limit) => fetchFromMangaDexFallback(plan, page, limit) }
-];
-
-// filters.page / filters.perPage are the new caller-facing pagination
-// params. Both optional — default to page 1 / 10 results, same as the
-// old hardcoded adapter defaults, so existing callers with no pagination
-// awareness see zero behavior change.
+/**
+ * Resolves the caller's requested page/limit from filters, defaulting to
+ * the old hardcoded values (page 1, 10 results) when absent or invalid.
+ */
 function resolvePagination(filters) {
   const rawPage = Number(filters?.page);
   const rawLimit = Number(filters?.perPage);
@@ -35,6 +37,13 @@ function resolvePagination(filters) {
   const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
   return { page, limit };
 }
+
+const MANGA_SOURCES = [
+  { name: 'anilist', fetch: (plan, page, limit) => fetchFromAniListUnified(plan, page, false, limit) },
+  { name: 'jikan', fetch: (plan, page, limit) => fetchFromJikanFallback(plan, page, limit) },
+  { name: 'kitsu', fetch: (plan, page, limit) => fetchFromKitsuFallback(plan, page, limit) },
+  { name: 'mangadex', fetch: (plan, page, limit) => fetchFromMangaDexFallback(plan, page, limit) }
+];
 
 function buildBasicPlan(query, filters) {
   if (Array.isArray(filters?.genres) && filters.genres.length > 0) {
@@ -132,6 +141,7 @@ async function runManga({ query, filters, supabase }) {
   const mood = await computeMoodSignal(supabase, query || '');
   const routing = mood ? getRoutingForMood(mood.aggregate) : { boostGenres: [], excludeGenres: [] };
   const classification = await computeQueryClassification(supabase, query || '');
+  const { page, limit } = resolvePagination(filters);
 
   const plan = buildBasicPlan(cleanQuery, filters);
 
@@ -141,7 +151,7 @@ async function runManga({ query, filters, supabase }) {
 
   for (const source of MANGA_SOURCES) {
     try {
-      let results = await source.fetch(plan);
+      let results = await source.fetch(plan, page, limit);
       if (results && results.length > 0) {
         if (routing.boostGenres.length > 0) {
           results = applyMoodBoost(results, routing.boostGenres);
@@ -158,14 +168,20 @@ async function runManga({ query, filters, supabase }) {
           queryGenreTerms: classification.genreTerms,
           boostGenres: routing.boostGenres,
         });
-        return { source: source.name, results, mood };
+        // hasMore is a heuristic, not a real total-count signal from any
+        // adapter: a full page probably means more results exist upstream,
+        // an under-full page means we've hit the end. Same "full page
+        // probably means more" approach the old frontend engine used
+        // (Notion "wiring search engine" Entry 15).
+        const hasMore = results.length === limit;
+        return { source: source.name, results, mood, page, hasMore };
       }
     } catch (err) {
       console.error(`[manga] ${source.name} failed`, err);
     }
   }
 
-  return { source: null, results: [], mood };
+  return { source: null, results: [], mood, page, hasMore: false };
 }
 
 export const DOMAINS = {
