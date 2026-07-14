@@ -203,12 +203,31 @@ async function mangadexQuery(offset, attempt = 0) {
   // MangaDex asks integrators to identify their client via User-Agent —
   // added 2026-07-14 after a 400 with no other obvious cause; harmless
   // either way, and rules this out as a possible factor.
-  const res = await fetch(`${MANGADEX_API_URL}?${params.toString()}`, {
-    headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'MyManga-search-engine/1.0 (+https://moodmanga.in)'
+  let res;
+  try {
+    res = await fetch(`${MANGADEX_API_URL}?${params.toString()}`, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'MyManga-search-engine/1.0 (+https://moodmanga.in)'
+      }
+    });
+  } catch (err) {
+    // NEW 2026-07-14: fetch() itself can throw before any HTTP response
+    // exists at all — e.g. the transient "http2 error: connection error
+    // received: not a result of an error" seen at offset 6600 in an
+    // earlier run. That's not a bad status code, so the retry logic below
+    // (which only triggers on `!res.ok`) never got a chance to run — the
+    // error just bubbled straight out and killed the whole harvest run.
+    // Treat network-level failures the same as a retryable HTTP status.
+    const isNetworkError = err instanceof TypeError || /connection error|SendRequest|network/i.test(err?.message || '');
+    if (isNetworkError && attempt < MAX_RETRIES) {
+      const delay = RETRY_BASE_DELAY_MS * Math.pow(2, attempt);
+      console.warn(`MangaDex network error (${err?.message}) — retrying in ${delay}ms (attempt ${attempt + 1}/${MAX_RETRIES})`);
+      await sleep(delay);
+      return mangadexQuery(offset, attempt + 1);
     }
-  });
+    throw err;
+  }
 
   if (!res.ok) {
     if (RETRYABLE_STATUS.has(res.status) && attempt < MAX_RETRIES) {
