@@ -1,4 +1,4 @@
-import { normalize, normalizeAndTokenize } from './parser/normalize.js';
+import { normalize, normalizeAndTokenize } from './parser/normalize.js'; 
 import { buildPlanFromGenreList } from './parser/searchPlanner.js';
 import { fetchFromAniListUnified } from './adapters/anilist.js';
 import { fetchFromJikanFallback } from './adapters/jikan.js';
