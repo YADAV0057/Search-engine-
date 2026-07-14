@@ -58,7 +58,7 @@ export function normalizeAndTokenize(input) {
 // for intent/genre/emotion classification. Words like "no"/"not" are kept:
 // they flip meaning ("no romance"), and excludedGenres logic downstream
 // depends on seeing them.
-const STOPWORDS = new Set([
+export const STOPWORDS = new Set([
     'a', 'an', 'the', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
     'i', 'me', 'my', 'you', 'your', 'it', 'its', 'this', 'that',
     'want', 'need', 'give', 'gives', 'looking', 'for', 'to', 'of', 'in',
