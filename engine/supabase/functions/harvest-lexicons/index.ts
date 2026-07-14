@@ -1,5 +1,5 @@
 // ==========================================
-// LEXICON HARVESTER — Edge Function entry point
+// LEXICON HARVESTER — Edge Function entry point 
 // supabase/functions/harvest-lexicons/index.ts 
 // ==========================================
 // POST /harvest-lexicons   (header: x-harvest-secret: <HARVEST_SECRET>)
