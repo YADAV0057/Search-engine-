@@ -6,6 +6,14 @@ import { fetchFromKitsuFallback } from './adapters/kitsu.js';
 import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
+import { rankResults } from './parser/rankResults.js';
+// TODO: confirm this import against the real, live queryClassifier.js before
+// deploying — not yet uploaded/verified this session, so classifyQuery()'s
+// actual export name and return shape are ASSUMED here based on the design
+// log (§10: rankCategories() returns [{category, score}, ...]), not
+// confirmed against real code. Same category of mistake already caught once
+// this session with fuzzyMatch.js — don't skip verifying this one too.
+import { classifyQuery } from './parser/queryClassifier.js';
 
 const MANGA_SOURCES = [
   { name: 'anilist', fetch: (plan) => fetchFromAniListUnified(plan) },
@@ -78,10 +86,32 @@ function applyMoodBoost(results, boostGenres) {
   return scored.map((s) => s.result);
 }
 
+// Wraps classifyQuery() with the same defensive try/catch pattern
+// computeMoodSignal() already uses above — a classifier failure (or a
+// missing/misconfigured supabase client) should degrade to "no classifier
+// signal" rather than take down the whole request. rankResults() already
+// has its own zero-signal fallback (even 1/3 split), so this is safe.
+async function computeQueryClassification(supabase, rawQuery) {
+  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [] };
+  try {
+    // ASSUMED SHAPE, not confirmed — see the import comment above. If the
+    // real classifyQuery() returns something different (e.g. doesn't
+    // include matched GENRE/TAG term strings alongside the ranked
+    // category/score list), this destructure needs to change to match.
+    const { ranked, genreTerms } = await classifyQuery(supabase, rawQuery);
+    return { ranked: ranked || [], genreTerms: genreTerms || [] };
+  } catch (err) {
+    console.error('[domains] query classification failed', err);
+    return { ranked: [], genreTerms: [] };
+  }
+}
+
 async function runManga({ query, filters, supabase }) {
   const cleanQuery = normalize(query || '');
+  const queryTokens = normalizeAndTokenize(query || '');
   const mood = await computeMoodSignal(supabase, query || '');
   const routing = mood ? getRoutingForMood(mood.aggregate) : { boostGenres: [], excludeGenres: [] };
+  const classification = await computeQueryClassification(supabase, query || '');
 
   const plan = buildBasicPlan(cleanQuery, filters);
 
@@ -96,6 +126,18 @@ async function runManga({ query, filters, supabase }) {
         if (routing.boostGenres.length > 0) {
           results = applyMoodBoost(results, routing.boostGenres);
         }
+        // Final ranking pass — runs after applyMoodBoost()'s soft re-rank,
+        // immediately before returning. Query-adaptive: weights come from
+        // the classifier's own per-query category scores, not a fixed
+        // formula. See §0-NEW9/§0-NEW10 in the Context Log for design +
+        // offline test results (9/9 passed against mock data).
+        results = rankResults(results, {
+          classifierRanked: classification.ranked,
+          moodAggregate: mood ? mood.aggregate : {},
+          queryTokens,
+          queryGenreTerms: classification.genreTerms,
+          boostGenres: routing.boostGenres,
+        });
         return { source: source.name, results, mood };
       }
     } catch (err) {
