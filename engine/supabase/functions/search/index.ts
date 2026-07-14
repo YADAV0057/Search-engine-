@@ -59,8 +59,7 @@ Deno.serve(async (req) => {
 
     const cached = await getCached(supabase, domain, cacheKey);
     if (cached) {
-      return json({ results: cached, cached: true, source: 'cache' }, 200, cors);
-    }
+      return json({ results, cached: false, source, mood }, 200, cors);
 
     const { source, results, mood } = await handler.run({ query, filters, supabase });
 
