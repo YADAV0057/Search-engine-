@@ -208,6 +208,30 @@ function kickBackgroundWarm() {
     warmVocab().catch(() => {}); // errors already logged inside warmVocab
 }
 
+// ADDED for rankResults.js (§0-NEW9, ranking formula): correctWord()/
+// levenshtein() above operate against the module's own vocab Set, not
+// against an arbitrary pair of strings, so there was no existing entry
+// point for "how similar are these two specific strings" (e.g. a query
+// token vs. one candidate's title). This is purely additive — reuses the
+// same levenshtein() already defined above, doesn't change correctTypos()/
+// correctTokens()/warmVocab() at all.
+/**
+ * 0–1 similarity between two strings (1 = identical, 0 = completely
+ * different), via the same edit-distance function used internally for
+ * vocab correction. Case-sensitive — callers should lowercase both sides
+ * first (ranking code already works with lowercased fields/tokens).
+ */
+export function similarity(a, b) {
+    if (!a || !b) return 0;
+    const dist = levenshtein(a, b);
+    const maxLen = Math.max(a.length, b.length);
+    if (maxLen === 0) return 0;
+    // levenshtein() returns 99 as a cheap-reject sentinel for very
+    // mismatched lengths (see its own early-exit comment above) — clamp
+    // so that doesn't produce a nonsensical negative similarity.
+    return Math.max(0, 1 - dist / maxLen);
+}
+
 /**
  * Corrects likely typos word-by-word against the known vocabulary (mood
  * concepts/aliases/modifiers + genre/title words, now including real
