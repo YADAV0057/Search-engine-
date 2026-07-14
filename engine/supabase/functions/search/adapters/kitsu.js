@@ -1,5 +1,5 @@
 // SAVE AS: engine/supabase/functions/search/adapters/kitsu.js
-
+ 
 // ==========================================
 // KITSU FALLBACK ENGINE (js/kitsu.js) 
 // ==========================================
