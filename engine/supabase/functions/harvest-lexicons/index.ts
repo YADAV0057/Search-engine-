@@ -1,6 +1,6 @@
 // ==========================================
 // LEXICON HARVESTER — Edge Function entry point
-// supabase/functions/harvest-lexicons/index.ts
+// supabase/functions/harvest-lexicons/index.ts 
 // ==========================================
 // POST /harvest-lexicons   (header: x-harvest-secret: <HARVEST_SECRET>)
 // { "entityTypes": ["genre","tag","staff","character","studio","media","media_mangadex","synonym"] }  (optional, default: all)
