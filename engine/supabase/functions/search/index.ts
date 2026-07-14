@@ -4,7 +4,7 @@
 // ==========================================
 // POST /search
 // { "domain": "manga", "query": "...", "filters": {...} }
-// -> { results: [...], cached: boolean, source?: string, mood?: {...} }
+// -> { results: [...], cached: boolean, source?: string, mood?: {...}, page?: number, hasMore?: boolean }
 //
 // RESTORED 2026-07-14 after this file went missing from the repo and the
 // live Supabase deploy was accidentally overwritten with the
@@ -16,6 +16,11 @@
 // v20-era behavior from the project's Notion "AI Context Log" (§0-NEW6):
 // pass `supabase` into the domain handler so mood scoring actually runs,
 // and include `mood` in the JSON response.
+//
+// UPDATED 2026-07-14 (Notion "wiring search engine" Entry 18): domains.js
+// now resolves page/limit from filters and returns `page`/`hasMore`
+// alongside `source`/`results`/`mood`. Both response branches below now
+// surface `hasMore` so the frontend doesn't have to guess.
 //
 // Cache hits intentionally omit `source`/`mood` — search_cache
 // (cache.js/getCached) only ever stores `results`, nothing else, so
@@ -79,10 +84,18 @@ Deno.serve(async (req) => {
     const cachedResults = await getCached(supabase, domain, cacheKey);
 
     if (cachedResults) {
-      return json({ results: cachedResults, cached: true }, 200, cors);
+      // hasMore on a cache hit: the cache key already encodes filters
+      // (including page/perPage — see cache.js's hashCacheKey), so a hit
+      // was necessarily stored under the SAME page/limit this request is
+      // asking for. Same full-page heuristic as a live fetch.
+      const limit = Number.isInteger(filters?.perPage) && filters.perPage > 0
+        ? Math.min(filters.perPage, 25)
+        : 10;
+      const hasMore = cachedResults.length === limit;
+      return json({ results: cachedResults, cached: true, hasMore }, 200, cors);
     }
 
-    const { source, results, mood } = await handler.run({ query, filters, supabase });
+    const { source, results, mood, page, hasMore } = await handler.run({ query, filters, supabase });
 
     // Don't cache empty/failed results — a transient upstream miss
     // shouldn't get frozen into the cache for the full TTL. (Not
@@ -93,10 +106,9 @@ Deno.serve(async (req) => {
       await setCached(supabase, domain, cacheKey, results, handler.ttlSeconds);
     }
 
-    return json({ results, cached: false, source, mood }, 200, cors);
+    return json({ results, cached: false, source, mood, page, hasMore }, 200, cors);
   } catch (err) {
     console.error('[search] request failed', err);
     return json({ error: 'Search failed', message: err?.message ?? String(err) }, 500, cors);
   }
 });
-
