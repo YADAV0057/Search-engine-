@@ -41,6 +41,9 @@ export async function fetchFromKitsuFallback(plan, page = 1, limit = 10) {
     // the default to match the original behavior.
     params.set('sort', plan.filters?.sort === 'rating' ? '-averageRating' : '-userCount');
 
+// Fetch each result's category (genre) data in the same request via
+// JSON:API's compound-document support — avoids an extra per-result call.
+params.set('include', 'categories');
     const genreList = [...(plan.primaryGenres || []), ...(plan.secondaryThemes || [])];
     const isGenreSearch = genreList.length > 0;
     const freeText = (plan.cleanQuery || '').trim();
@@ -83,9 +86,18 @@ export async function fetchFromKitsuFallback(plan, page = 1, limit = 10) {
         }
 
         const data = await response.json();
-        if (!data.data || !Array.isArray(data.data)) return [];
+if (!data.data || !Array.isArray(data.data)) return [];
 
-        return data.data.map(m => {
+// `include=categories` puts category resources in `included`, not `data`.
+// Build id -> display-name lookup once, reused for every result below.
+const categoryTitleById = new Map();
+for (const inc of data.included || []) {
+    if (inc?.type === 'categories' && inc?.attributes?.title) {
+        categoryTitleById.set(inc.id, inc.attributes.title);
+    }
+}
+
+return data.data.map(m => {
             const attr = m.attributes;
             return {
                 id: `kitsu-${m.id}`,
@@ -96,7 +108,9 @@ export async function fetchFromKitsuFallback(plan, page = 1, limit = 10) {
                 averageScore: attr.averageRating ? Math.round(parseFloat(attr.averageRating)) : null,
                 // NEW: userCount is Kitsu's own "higher is more popular" count.
                 popularity: typeof attr.userCount === 'number' ? attr.userCount : null,
-                genres: [], 
+                genres: (m.relationships?.categories?.data || [])
+    .map(ref => categoryTitleById.get(ref.id))
+    .filter(Boolean), 
                 description: attr.synopsis || null,
                 coverImage: { large: attr.posterImage?.large || attr.posterImage?.original || null },
                 chapters: attr.chapterCount || null,
