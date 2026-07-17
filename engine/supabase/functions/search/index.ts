@@ -4,7 +4,7 @@
 // ==========================================
 // POST /search
 // { "domain": "manga", "query": "...", "filters": {...} }
-// -> { results: [...], cached: boolean, source?: string, mood?: {...}, page?: number, hasMore?: boolean }
+// -> { results: [...], cached: boolean, source?: string, mood?: {...}, page?: number, hasMore?: boolean, routing?: {...}, classification?: {...} }
 //
 // RESTORED 2026-07-14 after this file went missing from the repo and the
 // live Supabase deploy was accidentally overwritten with the
@@ -22,11 +22,21 @@
 // alongside `source`/`results`/`mood`. Both response branches below now
 // surface `hasMore` so the frontend doesn't have to guess.
 //
-// Cache hits intentionally omit `source`/`mood` — search_cache
-// (cache.js/getCached) only ever stores `results`, nothing else, so
-// there is nothing to return for those two fields on a hit. This is a
+// UPDATED 2026-07-17 (Notion "Backend Update List" — aiPanel.js gap #1/#2,
+// Entry 25): domains.js's runManga() now also returns `routing`
+// (boostGenres/excludeGenres the mood signal produced) and `classification`
+// (the query classifier's ranked categories + matched genre/tag terms).
+// Both were already being computed internally for ranking — this just also
+// returns them, so aiPanel.js's "Detected X" / "Avoiding X" reasoning lines
+// have real data to render instead of none. Live-fetch branch only (see
+// cache note below for why the cache-hit branch doesn't get these too).
+//
+// Cache hits intentionally omit `source`/`mood`/`routing`/`classification`
+// — search_cache (cache.js/getCached) only ever stores `results`, nothing
+// else, so there is nothing to return for those fields on a hit. This is a
 // pre-existing, documented non-bug (see §0-NEW6's "cache doesn't store
-// mood" note), not something this restore changed.
+// mood" note, extended here to the two new fields), not something this
+// change alters.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { buildCorsHeaders } from './cors.js';
@@ -95,7 +105,8 @@ Deno.serve(async (req) => {
       return json({ results: cachedResults, cached: true, hasMore }, 200, cors);
     }
 
-    const { source, results, mood, page, hasMore } = await handler.run({ query, filters, supabase });
+    const { source, results, mood, page, hasMore, routing, classification } =
+      await handler.run({ query, filters, supabase });
 
     // Don't cache empty/failed results — a transient upstream miss
     // shouldn't get frozen into the cache for the full TTL. (Not
@@ -106,7 +117,11 @@ Deno.serve(async (req) => {
       await setCached(supabase, domain, cacheKey, results, handler.ttlSeconds);
     }
 
-    return json({ results, cached: false, source, mood, page, hasMore }, 200, cors);
+    return json(
+      { results, cached: false, source, mood, page, hasMore, routing, classification },
+      200,
+      cors
+    );
   } catch (err) {
     console.error('[search] request failed', err);
     return json({ error: 'Search failed', message: err?.message ?? String(err) }, 500, cors);
