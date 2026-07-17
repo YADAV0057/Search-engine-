@@ -52,7 +52,13 @@ const MOOD_INTENSITY_SATURATION = 10;
  * (e.g. {sadness: 3, hope: 4}) — used here only to derive intensity,
  * not to recompute mood.
  */
-function computeRankingWeights(classifierRanked, moodAggregate) {
+// computeRankingWeights — filters.genres is an explicit, structured scoring
+// request (the caller picked these genres directly), separate from whatever
+// the classifier found in the query text. Without this, the per-title
+// variance genreMatchScore() now produces still gets multiplied by a 0
+// weight whenever the classifier found no GENRE/TAG terms — the common
+// case for Mixer's mood-label-heavy queries.
+function computeRankingWeights(classifierRanked, moodAggregate, filterGenres) {
   const raw = { textMatch: 0, genreMatch: 0, emotionMatch: 0 };
 
   for (const { category, score } of classifierRanked) {
@@ -65,6 +71,10 @@ function computeRankingWeights(classifierRanked, moodAggregate) {
     }
     // unrecognized categories are ignored, not errors — keeps this forward
     // compatible if classifyQuery() ever adds a category
+  }
+
+  if (filterGenres && filterGenres.length > 0) {
+    raw.genreMatch += filterGenres.length;
   }
 
   // Intensity multiplier on EMOTION only, per user decision 2026-07-14:
@@ -133,11 +143,19 @@ function textMatchScore(candidate, queryTokens) {
  * genreMatch sub-score, 0–1: fraction of the query's genre/tag terms present
  * in the candidate's genres.
  */
-function genreMatchScore(candidate, queryGenreTerms) {
-  if (!queryGenreTerms || queryGenreTerms.length === 0) return 0;
+// genreMatchScore — now scores against filters.genres too, not just the
+// query-text classifier's genre terms. Mixer sends filters.genres as a hard
+// filter with no discriminating genre words in the free text, so
+// queryGenreTerms alone was always empty for that flow (Entry 26).
+function genreMatchScore(candidate, queryGenreTerms, filterGenres) {
+  const combined = new Set([
+    ...(queryGenreTerms || []).map((g) => g.toLowerCase()),
+    ...(filterGenres || []).map((g) => g.toLowerCase()),
+  ]);
+  if (combined.size === 0) return 0;
   const candidateGenres = new Set((candidate.genres || []).map((g) => g.toLowerCase()));
-  const hits = queryGenreTerms.filter((g) => candidateGenres.has(g.toLowerCase())).length;
-  return hits / queryGenreTerms.length;
+  const hits = [...combined].filter((g) => candidateGenres.has(g)).length;
+  return hits / combined.size;
 }
 
 /**
@@ -172,13 +190,13 @@ function computePopularityScores(results) {
  * Main entry point. Call after applyMoodBoost()'s hard-filter/soft-rerank
  * step, immediately before returning `results` to the client.
  */
-function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, boostGenres }) {
-  const weights = computeRankingWeights(classifierRanked, moodAggregate);
+function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, filterGenres, boostGenres }) {
+  const weights = computeRankingWeights(classifierRanked, moodAggregate, filterGenres);
   const popularityScores = computePopularityScores(results);
 
   const scored = results.map((candidate, i) => {
     const textMatch = textMatchScore(candidate, queryTokens);
-    const genreMatch = genreMatchScore(candidate, queryGenreTerms);
+    const genreMatch = genreMatchScore(candidate, queryGenreTerms, filterGenres);
     const emotionMatch = emotionMatchScore(candidate, boostGenres);
     const popularity = popularityScores[i];
 
