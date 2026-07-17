@@ -166,6 +166,7 @@ async function runManga({ query, filters, supabase }) {
           moodAggregate: mood ? mood.aggregate : {},
           queryTokens,
           queryGenreTerms: classification.genreTerms,
+          filterGenres: filters?.genres ?? [], 
           boostGenres: routing.boostGenres,
         });
         // hasMore is a heuristic, not a real total-count signal from any
