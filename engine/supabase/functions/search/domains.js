@@ -174,14 +174,37 @@ async function runManga({ query, filters, supabase }) {
         // probably means more" approach the old frontend engine used
         // (Notion "wiring search engine" Entry 15).
         const hasMore = results.length === limit;
-        return { source: source.name, results, mood, page, hasMore };
+        // ADDED 2026-07-17 (Notion "Backend Update List", aiPanel.js gap
+        // #1/#2, Entry 25): expose the routing decision (which genres were
+        // boosted/excluded off the mood signal) and the classifier's ranked
+        // categories + matched genre/tag terms. These were already computed
+        // above for internal ranking use — this just also returns them.
+        // aiPanel.js's "Detected X" / "Avoiding X" reasoning lines have no
+        // other data source; this is additive, nothing existing changes.
+        return {
+          source: source.name,
+          results,
+          mood,
+          page,
+          hasMore,
+          routing,
+          classification,
+        };
       }
     } catch (err) {
       console.error(`[manga] ${source.name} failed`, err);
     }
   }
 
-  return { source: null, results: [], mood, page, hasMore: false };
+  return {
+    source: null,
+    results: [],
+    mood,
+    page,
+    hasMore: false,
+    routing,
+    classification,
+  };
 }
 
 export const DOMAINS = {
