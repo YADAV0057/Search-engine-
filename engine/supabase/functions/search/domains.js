@@ -117,33 +117,54 @@ function buildBasicPlan(query, filters) {
 // browse (drama/sliceoflife) instead of a literal keyword search against
 // titles, which is what was producing "I Am No Hero of the Shadows!" and
 // similar mismatches.
-function applyMoodGenreRouting(basicPlan, cleanQuery, filters, routing, classification) {
+function applyMoodGenreRouting(basicPlan, cleanQuery, filters, routing, classification, negatedExcludeGenres) {
   const hasExplicitGenreFilter = Array.isArray(filters?.genres) && filters.genres.length > 0;
   if (hasExplicitGenreFilter) return basicPlan;
   if (classification.hasStrongTitleMatch) return basicPlan;
-  if (!routing.boostGenres || routing.boostGenres.length === 0) return basicPlan;
 
-  const topGenres = routing.boostGenres
+  const topGenres = (routing.boostGenres || [])
     .filter((g) => g.weight >= MOOD_GENRE_INCLUSION_THRESHOLD)
     .slice(0, MAX_MOOD_GENRES)
     .map((g) => g.genre);
 
-  if (topGenres.length === 0) return basicPlan;
+  if (topGenres.length > 0) {
+    const genrePlan = buildPlanFromGenreList(topGenres, { cleanQuery, sort: filters?.sort });
 
-  const genrePlan = buildPlanFromGenreList(topGenres, { cleanQuery, sort: filters?.sort });
+    // buildPlanFromGenreList() defaults status/maxChapters to null -- carry
+    // over whatever the caller actually asked for instead of silently
+    // dropping them, same as buildBasicPlan()'s default branch does.
+    genrePlan.filters.status = filters?.status ?? null;
+    genrePlan.filters.statusFilter = filters?.status ?? null;
+    genrePlan.filters.maxChapters = filters?.maxChapters ?? null;
+    genrePlan.excludedGenres = [...new Set([
+      ...(genrePlan.excludedGenres || []),
+      ...(filters?.excludedGenres ?? [])
+    ])];
 
-  // buildPlanFromGenreList() defaults status/maxChapters to null -- carry
-  // over whatever the caller actually asked for instead of silently
-  // dropping them, same as buildBasicPlan()'s default branch does.
-  genrePlan.filters.status = filters?.status ?? null;
-  genrePlan.filters.statusFilter = filters?.status ?? null;
-  genrePlan.filters.maxChapters = filters?.maxChapters ?? null;
-  genrePlan.excludedGenres = [...new Set([
-    ...(genrePlan.excludedGenres || []),
-    ...(filters?.excludedGenres ?? [])
-  ])];
+    return genrePlan;
+  }
 
-  return genrePlan;
+  // Entry 39 fix. No positive boost signal survived to build a genre_in
+  // search from (e.g. "I don't want anything sad" -- Entry 34 correctly
+  // suppresses "sad", so there's nothing left to boost). Previously this
+  // fell all the way through to buildBasicPlan()'s literal free-text
+  // search against the raw sentence -- the exact Entry 31/32 bug,
+  // re-triggered via a different path. Instead: drop the free-text term
+  // (so isGenreSearch AND the literal-search branch are both false --
+  // every adapter falls into a neutral, unfiltered-by-text popularity
+  // browse) but keep whatever genres the negation itself implied should be
+  // excluded. "I don't want anything sad" still keeps drama/psychological
+  // out of the results this way -- it just doesn't pretend to know what
+  // they DO want, unlike inverting the sentiment would.
+  if (negatedExcludeGenres && negatedExcludeGenres.length > 0) {
+    return {
+      ...basicPlan,
+      cleanQuery: '',
+      primaryGenres: [],
+    };
+  }
+
+  return basicPlan;
 }
 
 async function computeMoodSignal(supabase, rawQuery) {
@@ -152,9 +173,23 @@ async function computeMoodSignal(supabase, rawQuery) {
   if (tokens.length === 0) return null;
 
   try {
-    const { aggregate, perToken } = await analyzeQueryMood(supabase, tokens);
-    if (Object.keys(aggregate).length === 0) return null;
-    return { aggregate, matchedTerms: perToken.filter((t) => t.source) };
+    const { aggregate, negatedAggregate, perToken } = await analyzeQueryMood(supabase, tokens);
+    // Entry 39 fix: this used to bail to null whenever `aggregate` (positive
+    // signal) was empty -- which is exactly what happens for a query that's
+    // ALL negation, e.g. "I don't want anything sad" (Entry 34 correctly
+    // suppresses "sad" out of `aggregate`, leaving it empty). That silently
+    // threw away the negatedAggregate signal too, so the query fell all the
+    // way through to Entry 32's old literal-keyword-search fallback --
+    // exactly the bug Entry 32 was fixing, just re-triggered a different way.
+    // Now: only bail if BOTH are empty.
+    const hasPositive = Object.keys(aggregate).length > 0;
+    const hasNegated = Object.keys(negatedAggregate || {}).length > 0;
+    if (!hasPositive && !hasNegated) return null;
+    return {
+      aggregate,
+      negatedAggregate: negatedAggregate || {},
+      matchedTerms: perToken.filter((t) => t.source),
+    };
   } catch (err) {
     console.error('[domains] mood analysis failed', err);
     return null;
@@ -207,14 +242,29 @@ async function runManga({ query, filters, supabase }) {
   const queryTokens = normalizeAndTokenize(query || '');
   const mood = await computeMoodSignal(supabase, query || '');
   const routing = mood ? getRoutingForMood(mood.aggregate) : { boostGenres: [], excludeGenres: [] };
+  // Entry 39: a second routing pass, over the NEGATED aggregate. We only
+  // take its boostGenres -- the genres that emotion would have boosted had
+  // it not been negated -- and treat those as genres to exclude. We
+  // deliberately ignore negatedRouting.excludeGenres (the genres that
+  // emotion's OWN routing table entry excludes): un-negating an exclusion
+  // is an inversion ("not sad" -> implicitly wants comedy?), which is the
+  // same semantically-murky move Entry 34 already rejected. Excluding what
+  // was explicitly ruled out is a narrower, safer claim than including its
+  // opposite.
+  const negatedRouting = mood ? getRoutingForMood(mood.negatedAggregate) : { boostGenres: [], excludeGenres: [] };
+  const negatedExcludeGenres = (negatedRouting.boostGenres || []).map((g) => g.genre);
   const classification = await computeQueryClassification(supabase, query || '');
   const { page, limit } = resolvePagination(filters);
 
   let plan = buildBasicPlan(cleanQuery, filters);
-  plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification);
+  plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification, negatedExcludeGenres);
 
-  if (routing.excludeGenres.length > 0) {
-    plan.excludedGenres = [...new Set([...(plan.excludedGenres || []), ...routing.excludeGenres])];
+  if (routing.excludeGenres.length > 0 || negatedExcludeGenres.length > 0) {
+    plan.excludedGenres = [...new Set([
+      ...(plan.excludedGenres || []),
+      ...routing.excludeGenres,
+      ...negatedExcludeGenres,
+    ])];
   }
 
   const moodMatchedTerms = mood ? mood.matchedTerms : [];
