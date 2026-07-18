@@ -1,5 +1,5 @@
 export const VALID_ROUTING_GENRES = [
-  'action', 'adventure', 'comedy', 'drama', 'fantasy', 'horror',
+  'action', 'adventure', 'comedy', 'drama', 'fantasy', 'horror', 
   'mystery', 'psychological', 'romance', 'scifi', 'sliceoflife',
   'sports', 'supernatural', 'thriller'
 ];
