@@ -65,11 +65,21 @@ export async function fetchFromAniListUnified(plan, page = 1, isKorean = false, 
     }
 
     // Sort: preserves the original defaults (POPULARITY_DESC for genre/blank
-    // search, [SEARCH_MATCH, POPULARITY_DESC] for free text) and adds an
-    // explicit "rating" option now that the planner can request one.
+    // search, [SEARCH_MATCH, POPULARITY_DESC] for free text) and adds
+    // explicit "rating"/"trending"/"date" options now that the planner can
+    // request them.
+    // FIX: 'trending' and 'date' used to fall through to the generic
+    // POPULARITY_DESC branch below, silently making Trending Today
+    // identical to a plain popularity sort, and making New Releases'
+    // "newest first" request a no-op (compounded by startDate never being
+    // requested at all — see the query string below).
     let sortValues;
     if (plan.filters?.sort === 'rating') {
         sortValues = ['SCORE_DESC'];
+    } else if (plan.filters?.sort === 'trending') {
+        sortValues = ['TRENDING_DESC'];
+    } else if (plan.filters?.sort === 'date') {
+        sortValues = ['START_DATE_DESC'];
     } else if (isGenreSearch || !variables.search) {
         sortValues = ['POPULARITY_DESC'];
     } else {
@@ -81,7 +91,7 @@ export async function fetchFromAniListUnified(plan, page = 1, isKorean = false, 
         query (${queryArgs}) {
             Page(page: $page, perPage: $perPage) {
                 media(${mediaArgs}) {
-                    id title { romaji english } averageScore genres description(asHtml: false) coverImage { large } chapters status popularity
+                    id title { romaji english } averageScore genres description(asHtml: false) coverImage { large } chapters status popularity startDate { year month day }
                     staff(sort: RELEVANCE, perPage: 3) { edges { role node { name { full } } } }
                 }
             }
@@ -107,7 +117,21 @@ export async function fetchFromAniListUnified(plan, page = 1, isKorean = false, 
             return [];
         }
 
-        return data.data ? data.data.Page.media : [];
+        const media = data.data ? data.data.Page.media : [];
+
+        // FIX: fetch.js's fetchNewReleases() reads m.releaseDate directly,
+        // but AniList only ever gave us startDate:{year,month,day} — that
+        // field was always undefined, so the client-side "newest first"
+        // sort had nothing to sort and New Releases just showed whatever
+        // POPULARITY_DESC happened to return. Build a real ISO date (or
+        // null if AniList hasn't set one, e.g. an unannounced release).
+        return media.map(m => {
+            const sd = m.startDate;
+            const releaseDate = (sd && sd.year)
+                ? `${sd.year}-${String(sd.month || 1).padStart(2, '0')}-${String(sd.day || 1).padStart(2, '0')}`
+                : null;
+            return { ...m, releaseDate };
+        });
     } catch (error) {
         console.error("AniList API Error:", error);
         return [];
