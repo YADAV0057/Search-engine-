@@ -225,6 +225,87 @@ async function runManga({ query, filters, supabase }) {
     plan.excludedGenres = [...new Set([...(plan.excludedGenres || []), ...routing.excludeGenres])];
   }
 
+  // FAN-OUT MODE (Notion "Backend Update List", multi-source fan-out
+  // request): Advanced Filter's fetchAll.js used to genuinely query all 4
+  // sources in parallel and hand each source's results to merge.js
+  // separately — the waterfall-stop-at-first-hit behavior above collapsed
+  // that into "whichever single source answered first", which merge.js
+  // can still consume (it only needs the {source, items}[] shape) but
+  // with 3 of 4 buckets always empty, so results felt thinner.
+  //
+  // Opt-in via filters.fanOut (boolean) so every other caller — landing
+  // page rows, Mixer, plain search — keeps the existing waterfall
+  // behavior and its early-exit performance benefit unchanged. When set,
+  // all 4 adapters are queried concurrently (Promise.allSettled, so one
+  // slow/failed source never blocks the others), each source's own
+  // post-fetch-filtered results are kept in their own bucket
+  // (bySource.<name>), and nothing is capped/deduped across sources here
+  // — that's merge.js's job, same as before the engine cutover.
+  const fanOut = !!filters?.fanOut;
+
+  if (fanOut) {
+    const bySource = { anilist: [], jikan: [], kitsu: [], mangadex: [] };
+    let anySourceHadFullRawPageFO = false;
+
+    const settled = await Promise.allSettled(
+      MANGA_SOURCES.map((source) => source.fetch(plan, page, limit))
+    );
+
+    settled.forEach((result, i) => {
+      const source = MANGA_SOURCES[i];
+      if (result.status !== 'fulfilled') {
+        console.error(`[manga] ${source.name} failed`, result.reason);
+        return;
+      }
+      const rawResults = result.value;
+      if (rawResults && rawResults.length === limit) anySourceHadFullRawPageFO = true;
+      bySource[source.name] = applyPostFetchFilters(rawResults, filters) || [];
+    });
+
+    // Still provide a single merged/ranked `results` list too, so any
+    // caller that doesn't care about per-source buckets (or an older
+    // frontend build that hasn't picked up bySource yet) keeps working
+    // exactly like the non-fanOut path.
+    const seenTitlesFO = new Set();
+    const mergedFO = [];
+    for (const source of MANGA_SOURCES) {
+      for (const item of bySource[source.name]) {
+        const key = normalizeTitleKey(item);
+        if (key && seenTitlesFO.has(key)) continue;
+        if (key) seenTitlesFO.add(key);
+        mergedFO.push(item);
+      }
+    }
+
+    let resultsFO = mergedFO;
+    if (routing.boostGenres.length > 0) {
+      resultsFO = applyMoodBoost(resultsFO, routing.boostGenres);
+    }
+    resultsFO = rankResults(resultsFO, {
+      classifierRanked: classification.ranked,
+      moodAggregate: mood ? mood.aggregate : {},
+      queryTokens,
+      queryGenreTerms: classification.genreTerms,
+      filterGenres: filters?.genres ?? [],
+      boostGenres: routing.boostGenres,
+    });
+
+    const contributingSourcesFO = MANGA_SOURCES
+      .filter((s) => bySource[s.name].length > 0)
+      .map((s) => s.name);
+
+    return {
+      source: contributingSourcesFO.join('+') || null,
+      results: resultsFO,
+      bySource,
+      mood,
+      page,
+      hasMore: anySourceHadFullRawPageFO,
+      routing,
+      classification,
+    };
+  }
+
   // Accumulate across sources instead of stopping at the first one with
   // any filtered survivors — see WATERFALL FIX note above.
   const accumulated = [];
