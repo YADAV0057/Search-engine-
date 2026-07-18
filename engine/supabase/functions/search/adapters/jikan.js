@@ -19,7 +19,13 @@ const STATUS_TO_JIKAN = {
     FINISHED: 'complete',
     RELEASING: 'publishing',
     HIATUS: 'hiatus',
-    CANCELLED: 'discontinued'
+    CANCELLED: 'discontinued',
+    // FIX: was missing — silently dropped the status filter for Most
+    // Awaited (NOT_YET_RELEASED), causing Jikan to top up that row with
+    // generic popular *currently-releasing* titles, which duplicated
+    // Trending Today's results whenever AniList didn't have 25 genuinely
+    // unreleased manga to fill the row on its own.
+    NOT_YET_RELEASED: 'upcoming'
 };
 
 const JIKAN_STATUS_TO_INTERNAL = {
