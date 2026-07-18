@@ -1,4 +1,4 @@
-// engine/supabase/functions/search/parser/dictionary.js
+// engine/supabase/functions/search/parser/dictionary.js 
 //
 // MOOD_DICTIONARY / URGENCY_MODIFIERS are still placeholders — not
 // salvaged/rebuilt yet.
