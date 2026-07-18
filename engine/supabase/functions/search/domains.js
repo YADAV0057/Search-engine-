@@ -8,6 +8,7 @@ import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
 import { classifyQuery, rankCategories, hasStrongTitleMatch } from './parser/queryClassifier.js';
+import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -254,6 +255,13 @@ async function runManga({ query, filters, supabase }) {
   const negatedRouting = mood ? getRoutingForMood(mood.negatedAggregate) : { boostGenres: [], excludeGenres: [] };
   const negatedExcludeGenres = (negatedRouting.boostGenres || []).map((g) => g.genre);
   const classification = await computeQueryClassification(supabase, query || '');
+  // Entry 35/40. Reuses the mood signal already computed above (acclaim is
+  // just another emotion key in the same lexicon table -- see
+  // acclaimScoring.js's header comment) plus a Groq fallback for
+  // paraphrased acclaim language the lexicon wasn't seeded for. Fails
+  // closed to { intensity: 0, source: null } on any error/missing key, so
+  // this can never block or degrade a search that isn't asking for it.
+  const acclaim = await computeAcclaimIntensity(mood, query || '', Deno.env.get('GROQ_API_KEY'));
   const { page, limit } = resolvePagination(filters);
 
   let plan = buildBasicPlan(cleanQuery, filters);
@@ -313,6 +321,7 @@ async function runManga({ query, filters, supabase }) {
       filterGenres: filters?.genres ?? [],
       boostGenres: routing.boostGenres,
       moodMatchedTerms,
+      acclaimIntensity: acclaim.intensity,
     });
 
     const contributingSourcesFO = MANGA_SOURCES
@@ -328,6 +337,7 @@ async function runManga({ query, filters, supabase }) {
       hasMore: anySourceHadFullRawPageFO,
       routing,
       classification,
+      acclaim,
     };
   }
 
@@ -376,6 +386,7 @@ async function runManga({ query, filters, supabase }) {
       filterGenres: filters?.genres ?? [], 
       boostGenres: routing.boostGenres,
       moodMatchedTerms,
+      acclaimIntensity: acclaim.intensity,
     });
 
     const hasMore = accumulated.length >= limit && anySourceHadFullRawPage;
@@ -388,6 +399,7 @@ async function runManga({ query, filters, supabase }) {
       hasMore,
       routing,
       classification,
+      acclaim,
     };
   }
 
@@ -399,6 +411,7 @@ async function runManga({ query, filters, supabase }) {
     hasMore: false,
     routing,
     classification,
+    acclaim,
   };
 }
 
