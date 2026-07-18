@@ -37,6 +37,24 @@
 // pre-existing, documented non-bug (see §0-NEW6's "cache doesn't store
 // mood" note, extended here to the two new fields), not something this
 // change alters.
+//
+// FIXED 2026-07-18 (frontend/backend contract mismatch): this validation
+// used to be `if (!query || typeof query !== 'string')`, which rejects an
+// EMPTY string query with a 400 — but a filters-only browse request (no
+// search text at all) is a legitimate shape. js/search.js's
+// triggerQuickFilter() (the "Finish tonight" / "Long binge" / "Completed"
+// chips) sends exactly that: `triggerSearch('', 1, false, extraFilters)`.
+// That 400 was silently swallowed by callSearchEngine() throwing, caught
+// by triggerSearch(), and rendered as "Something went wrong searching —
+// try again in a moment." straight into #community-grid — which happens
+// to be the SAME grid element topPicks.js renders "Today's Top Picks"
+// into, so the leftover error from the last quick-filter tap was showing
+// up there instead. (topPicks.js itself already worked around this exact
+// restriction by hardcoding a non-empty `query: 'top rated manga'` — see
+// its own header comment.) Now only a missing/non-string query (null,
+// undefined, a number, etc.) is rejected; an empty string is treated as
+// "no free-text term, filters only" and passed straight through to the
+// domain handler, same as any other query.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { buildCorsHeaders } from './cors.js';
@@ -85,8 +103,11 @@ Deno.serve(async (req) => {
     return json({ error: `Unknown domain "${domain}"` }, 400, cors);
   }
 
-  if (!query || typeof query !== 'string') {
-    return json({ error: '"query" is required' }, 400, cors);
+  // FIXED 2026-07-18: only reject a missing/non-string query. An empty
+  // string ('') is a valid "filters-only browse, no free text" request —
+  // see the fix note at the top of this file.
+  if (typeof query !== 'string') {
+    return json({ error: '"query" must be a string (use "" for a filters-only browse)' }, 400, cors);
   }
 
   try {
