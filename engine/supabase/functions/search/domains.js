@@ -225,6 +225,14 @@ async function runManga({ query, filters, supabase }) {
     plan.excludedGenres = [...new Set([...(plan.excludedGenres || []), ...routing.excludeGenres])];
   }
 
+  // moodMatchedTerms: analyzeQueryMood()'s perToken hits (e.g. "cozy",
+  // "heartwarming", "slow burn"), already computed above via
+  // computeMoodSignal() — no new fetch. Passed through to rankResults() so
+  // it has a fallback discriminator available for the saturation case (see
+  // rankResults.js's 2026-07-18 fix note) without needing any new data
+  // source. Deliberately a plain array (or []), not re-derived here.
+  const moodMatchedTerms = mood ? mood.matchedTerms : [];
+
   // FAN-OUT MODE (Notion "Backend Update List", multi-source fan-out
   // request): Advanced Filter's fetchAll.js used to genuinely query all 4
   // sources in parallel and hand each source's results to merge.js
@@ -288,6 +296,7 @@ async function runManga({ query, filters, supabase }) {
       queryGenreTerms: classification.genreTerms,
       filterGenres: filters?.genres ?? [],
       boostGenres: routing.boostGenres,
+      moodMatchedTerms,
     });
 
     const contributingSourcesFO = MANGA_SOURCES
@@ -352,6 +361,7 @@ async function runManga({ query, filters, supabase }) {
       queryGenreTerms: classification.genreTerms,
       filterGenres: filters?.genres ?? [], 
       boostGenres: routing.boostGenres,
+      moodMatchedTerms,
     });
 
     // hasMore: we filled the page exactly to `limit` AND at least one
