@@ -110,6 +110,14 @@ export async function analyzeQueryMood(supabase, tokens) {
 
   const claimed = new Array(cleanTokens.length).fill(false);
   const matches = [];
+  // Entry 39: negated hits are no longer discarded -- they're routed here
+  // instead of into `matches`, so domains.js can turn "what emotion was
+  // negated" into an exclude-genres signal rather than throwing the
+  // information away. See moodLexicon.js's header-level notes on Entry 34
+  // for why this stays a suppression, not an inversion (buildEmotionsFromAfinn
+  // still reports what the word WOULD have meant un-negated -- domains.js
+  // decides what to do with that, this module just stops hiding it).
+  const negatedMatches = [];
 
   for (let n = Math.min(MAX_PHRASE_WORDS, cleanTokens.length); n >= 1; n--) {
     for (let start = 0; start + n <= cleanTokens.length; start++) {
@@ -119,32 +127,39 @@ export async function analyzeQueryMood(supabase, tokens) {
       }
       if (overlaps) continue;
 
-      // Entry 34: a phrase that falls (even partially) inside a negation
-      // scope is skipped entirely -- suppressed, not matched -- rather than
-      // contributing its emotions as if the negation weren't there.
+      const phrase = cleanTokens.slice(start, start + n).join(' ');
+      if (!lexiconMap.has(phrase)) continue;
+
       let anyNegated = false;
       for (let i = start; i < start + n; i++) {
         if (negated[i]) { anyNegated = true; break; }
       }
-      if (anyNegated) continue;
 
-      const phrase = cleanTokens.slice(start, start + n).join(' ');
-      if (lexiconMap.has(phrase)) {
-        matches.push({ term: phrase, emotions: lexiconMap.get(phrase), source: 'custom_lexicon' });
-        for (let i = start; i < start + n; i++) claimed[i] = true;
+      const emotions = lexiconMap.get(phrase);
+      const entry = { term: phrase, emotions, source: 'custom_lexicon' };
+      if (anyNegated) {
+        negatedMatches.push(entry);
+      } else {
+        matches.push(entry);
       }
+      for (let i = start; i < start + n; i++) claimed[i] = true;
     }
   }
 
   for (let i = 0; i < cleanTokens.length; i++) {
     if (claimed[i]) continue;
-    if (negated[i]) continue; // Entry 34: suppress negated single-word AFINN hits too
     const word = cleanTokens[i];
     if (STOPWORDS.has(word)) continue;
 
     const afinnScore = getAfinnScore(word);
-    if (afinnScore !== null) {
-      matches.push({ term: word, emotions: buildEmotionsFromAfinn(afinnScore, word), source: 'afinn' });
+    if (afinnScore === null) continue;
+
+    const emotions = buildEmotionsFromAfinn(afinnScore, word);
+    const entry = { term: word, emotions, source: 'afinn' };
+    if (negated[i]) {
+      negatedMatches.push(entry);
+    } else {
+      matches.push(entry);
     }
   }
 
@@ -155,7 +170,16 @@ export async function analyzeQueryMood(supabase, tokens) {
     }
   }
 
-  return { perToken: matches, aggregate };
+  // Entry 39: parallel aggregate for negated hits, same shape as `aggregate`,
+  // so getRoutingForMood() can be reused as-is against it in domains.js.
+  const negatedAggregate = {};
+  for (const m of negatedMatches) {
+    for (const [emotion, intensity] of Object.entries(m.emotions)) {
+      negatedAggregate[emotion] = (negatedAggregate[emotion] || 0) + intensity;
+    }
+  }
+
+  return { perToken: matches, aggregate, negatedAggregate, negatedTerms: negatedMatches };
 }
 
 export async function getEmotionsForTerm(supabase, term) {
