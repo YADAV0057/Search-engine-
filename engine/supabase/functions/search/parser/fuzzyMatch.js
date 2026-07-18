@@ -1,6 +1,6 @@
 // js/parser/fuzzyMatch.js
 //
-// Typo tolerance for the mood/synonym phrase matchers. Those match exact
+// Typo tolerance for the mood/synonym phrase matchers. Those match exact 
 // strings, so a misspelling like "rivalery" or "acedemic" never matches
 // "academic rivalry" at all, no matter how close it is. This corrects each
 // word to the nearest known vocabulary word before anything else runs —
