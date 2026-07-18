@@ -1,4 +1,5 @@
 import { getAfinnScore } from './dictionary/afinn.js';
+import { getEmotionWordOverride } from './emotionWords.js';
 import { STOPWORDS } from './normalize.js';
 
 const MAX_PHRASE_WORDS = 4;
@@ -9,10 +10,22 @@ function scoreToTone(score) {
   return 'neutral';
 }
 
-function buildEmotionsFromAfinn(score) {
+// UPDATED (Notion "Backend Update List" -- richer mood taxonomy on the
+// AFINN fallback): previously this collapsed every AFINN-scored word to
+// plain {positive}/{negative}. Now checks emotionWords.js's curated
+// word -> MANGA_ROUTING-key override first, so common words resolve to
+// calm/dread/joy/etc. instead. Falls back to the old positive/negative
+// behavior for any word not in that map (still the majority of AFINN's
+// ~3000 words -- this is intentionally a high-precision subset, not full
+// coverage. See emotionWords.js for rationale/known gaps.)
+function buildEmotionsFromAfinn(score, word) {
   const tone = scoreToTone(score);
   if (tone === 'neutral') return {};
   const intensity = Math.min(Math.abs(score) * 2, 10);
+
+  const override = getEmotionWordOverride(word);
+  if (override) return { [override]: intensity };
+
   return { [tone]: intensity };
 }
 
@@ -78,7 +91,7 @@ export async function analyzeQueryMood(supabase, tokens) {
 
     const afinnScore = getAfinnScore(word);
     if (afinnScore !== null) {
-      matches.push({ term: word, emotions: buildEmotionsFromAfinn(afinnScore), source: 'afinn' });
+      matches.push({ term: word, emotions: buildEmotionsFromAfinn(afinnScore, word), source: 'afinn' });
     }
   }
 
@@ -110,7 +123,7 @@ export async function getEmotionsForTerm(supabase, term) {
 
   const afinnScore = getAfinnScore(normalized);
   if (afinnScore !== null) {
-    return { emotions: buildEmotionsFromAfinn(afinnScore), source: 'afinn' };
+    return { emotions: buildEmotionsFromAfinn(afinnScore, normalized), source: 'afinn' };
   }
 
   return { emotions: {}, source: null };
