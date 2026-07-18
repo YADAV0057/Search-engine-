@@ -8,7 +8,7 @@ const PAGE_SIZE = 1000;
 const MIN_SIGNIFICANT_WORD_LENGTH = 4;
 
 // Entry 33 fix: how similar the full query needs to be to an actual title
-// (via fuzzyMatch.js's similarity(), same Levenshtein-based scorer used for
+// (via fuzzyMatch.js's similarity(), same Levenshtein-based scorer used for 
 // typo correction) before we trust it as a real title search. The old
 // "any single ≥4-letter word overlaps any of 9,912 titles" check
 // (matchesCategoryPhrase, still used below for building the *candidate*
