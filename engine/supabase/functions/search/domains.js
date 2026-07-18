@@ -142,7 +142,13 @@ function buildBasicPlan(query, filters) {
     apiOrder: ['anilist', 'jikan', 'kitsu', 'mangadex'],
     filters: {
       status: filters?.status ?? null,
-      statusFilter: null,
+      // FIX: this was hardcoded to null, so the `status` value above never
+      // reached any adapter — mangadex.js (and likely anilist.js/jikan.js/
+      // kitsu.js) reads plan.filters.statusFilter specifically. That's why
+      // Trending Today / New Releases (RELEASING) / Most Awaited
+      // (NOT_YET_RELEASED) were all returning identical unfiltered
+      // popularity-sorted results.
+      statusFilter: filters?.status ?? null,
       sort: filters?.sort ?? 'relevance',
       maxChapters: filters?.maxChapters ?? null
     },
