@@ -55,7 +55,16 @@
 // there's still something real to discriminate on. Un-saturated queries
 // (the common case) are completely unaffected — descriptionMatch is only
 // computed and only weighted in when saturation is actually detected.
+//
+// ADDED (Entry 35/40): a Bayesian quality-score term, weighted by how
+// strongly the query expresses acclaim/quality intent (acclaimScoring.js's
+// computeAcclaimIntensity(), computed in domains.js and passed in here as
+// `acclaimIntensity`). A query with zero acclaim intent gets zero weight
+// on this term — quality score never distorts an ordinary genre/mood
+// search, it only kicks in for queries actually asking for "the best" /
+// "critically acclaimed" / "something I'll remember for years".
 import { similarity } from './fuzzyMatch.js';
+import { computeQualityScores } from './acclaimScoring.js';
 
 const POPULARITY_WEIGHT = 0.10; // small tiebreaker, not a driver — mood/niche
                                  // discovery is the product, a popular but
@@ -67,6 +76,13 @@ const INTENT_WEIGHT = 1 - POPULARITY_WEIGHT;
 // Tunable — 10 is a starting guess (e.g. "devastated"+"heartbroken"+"tragedy"
 // AFINN-doubled = 14 in the §0 worked example, so that case saturates to 1.0).
 const MOOD_INTENSITY_SATURATION = 10;
+
+// Entry 35/40. Ceiling on how much of the intent budget the quality score
+// can claim, reached only at acclaimIntensity === 1 (maximal, unambiguous
+// acclaim intent). At acclaimIntensity 0 this contributes nothing, same as
+// today's behavior for every query that isn't asking for "the best" —
+// existing genre/mood/title search results are unaffected by default.
+const MAX_QUALITY_WEIGHT = 0.4;
 
 /**
  * Turns a rankCategories() result (e.g. [{category:'EMOTION',score:2},
@@ -260,10 +276,17 @@ function computePopularityScores(results) {
  * something to score against. Optional — omitting it just means the
  * saturation fallback silently contributes 0 (same as today) instead of
  * throwing.
+ *
+ * acclaimIntensity: 0-1, from acclaimScoring.js's computeAcclaimIntensity()
+ * (computed once in domains.js's runManga(), passed through here same as
+ * boostGenres/moodMatchedTerms). Optional, defaults to 0 — a query with no
+ * acclaim intent gets the exact same ranking behavior as before this was
+ * added.
  */
-function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, filterGenres, boostGenres, moodMatchedTerms }) {
+function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, filterGenres, boostGenres, moodMatchedTerms, acclaimIntensity = 0 }) {
   const weights = computeRankingWeights(classifierRanked, moodAggregate, filterGenres);
   const popularityScores = computePopularityScores(results);
+  const qualityScores = computeQualityScores(results);
 
   // First pass: compute every sub-score up front so we can look across the
   // whole batch (needed to detect saturation) before deciding how much
@@ -274,6 +297,7 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
     genreMatch: genreMatchScore(candidate, queryGenreTerms, filterGenres),
     emotionMatch: emotionMatchScore(candidate, boostGenres),
     popularity: popularityScores[i],
+    quality: qualityScores[i],
   }));
 
   const genreSaturated = isSaturated(partial.map((p) => p.genreMatch));
@@ -283,8 +307,15 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
   // signal to work with and descriptionMatch would just add noise.
   const saturated = genreSaturated && emotionSaturated && (weights.genreMatch + weights.emotionMatch) > 0;
 
-  const scored = partial.map(({ candidate, textMatch, genreMatch, emotionMatch, popularity }) => {
-    let intentScore;
+  // Entry 35/40. How much of the intent budget quality claims this batch —
+  // zero for an ordinary query, up to MAX_QUALITY_WEIGHT for a query that
+  // maximally expresses acclaim intent. Computed once per batch (not per
+  // candidate) since it depends only on the query, not any one result.
+  const qualityWeight = MAX_QUALITY_WEIGHT * Math.max(0, Math.min(1, acclaimIntensity));
+  const remainingWeight = 1 - qualityWeight;
+
+  const scored = partial.map(({ candidate, textMatch, genreMatch, emotionMatch, popularity, quality }) => {
+    let baseIntentScore;
     let descriptionMatch = 0;
 
     if (saturated) {
@@ -294,13 +325,19 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
       // weight to descriptionMatch instead of just discarding it.
       descriptionMatch = descriptionMatchScore(candidate, moodMatchedTerms);
       const borrowedWeight = weights.genreMatch + weights.emotionMatch;
-      intentScore = weights.textMatch * textMatch + borrowedWeight * descriptionMatch;
+      baseIntentScore = weights.textMatch * textMatch + borrowedWeight * descriptionMatch;
     } else {
-      intentScore =
+      baseIntentScore =
         weights.textMatch * textMatch +
         weights.genreMatch * genreMatch +
         weights.emotionMatch * emotionMatch;
     }
+
+    // Entry 35/40. Quality score only ever displaces part of the existing
+    // intent budget, scaled by how strongly the query asked for it —
+    // qualityWeight is 0 for any query without acclaim intent, so
+    // intentScore === baseIntentScore in that case, unchanged from before.
+    const intentScore = remainingWeight * baseIntentScore + qualityWeight * quality;
 
     const finalScore = INTENT_WEIGHT * intentScore + POPULARITY_WEIGHT * popularity;
 
@@ -308,7 +345,7 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
       ...candidate,
       _rankDebug: {
         textMatch, genreMatch, emotionMatch, descriptionMatch, popularity,
-        weights, saturated, finalScore
+        quality, qualityWeight, weights, saturated, finalScore
       },
       finalScore
     };
