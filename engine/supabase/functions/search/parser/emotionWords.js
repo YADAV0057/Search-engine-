@@ -1,5 +1,5 @@
 // engine/supabase/functions/search/parser/emotionWords.js
-//
+// 
 // Curated AFINN-word -> richer-emotion overrides for the AFINN fallback
 // path (see Notion "Backend Update List" -- "Richer mood taxonomy on the
 // AFINN fallback"). AFINN only encodes a signed intensity per word, not
