@@ -7,35 +7,115 @@ import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
-// Confirmed against the real, live queryClassifier.js (2026-07-14).
-// classifyQuery(supabase, rawQuery) returns { [category]: { score, matches } }
-// — NOT a ranked list by itself. rankCategories(scores) is the separate
-// step that turns it into [{category, score}, ...] sorted highest-first.
 import { classifyQuery, rankCategories } from './parser/queryClassifier.js';
 
-// ==========================================
-// PAGINATION — added 2026-07-14 (Notion "wiring search engine" Entry 18)
-// ==========================================
-// Root cause: runManga() never passed page/limit to any adapter, so every
-// search was hardcoded to the first 10 results regardless of what a caller
-// asked for. All 4 adapters already accepted (plan, page, limit) params —
-// domains.js just wasn't supplying them. This is additive: a caller that
-// sends no filters.page/perPage gets the exact same behavior as before
-// (page 1, 10 results).
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
-const MAX_LIMIT = 25; // Jikan hard-caps at 25/page — keep every source consistent
+const MAX_LIMIT = 25;
 
-/**
- * Resolves the caller's requested page/limit from filters, defaulting to
- * the old hardcoded values (page 1, 10 results) when absent or invalid.
- */
 function resolvePagination(filters) {
   const rawPage = Number(filters?.page);
   const rawLimit = Number(filters?.perPage);
   const page = Number.isInteger(rawPage) && rawPage > 0 ? rawPage : DEFAULT_PAGE;
   const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
   return { page, limit };
+}
+
+// ==========================================
+// Backend Update List batch (sort/filter additions):
+// - sort:'popularity' — now EXPLICIT and forced across all 4 adapters,
+//   rather than an accidental side-effect of the default branch (which
+//   previously broke for MangaDex on a free-text query — it would use
+//   order[relevance] instead of a popularity order).
+// - sort:'trending' — AniList has a real TRENDING_DESC enum value, so this
+//   is a genuine trending signal there. Jikan/Kitsu/MangaDex have no
+//   trending metric at all, so they fall back to their popularity sort for
+//   this value (documented in each adapter, not silently ignored).
+// - filters.minScore / filters.maxPopularity — NEW. Applied as a
+//   post-fetch filter below (no adapter exposes a clean score/popularity
+//   threshold param across all 4 sources, so this is enforced here rather
+//   than per-adapter, same pattern as the exclude-genre re-check Kitsu
+//   already needed).
+// - filters.minChapters — NEW, filters.maxChapters — FIXED (was accepted
+//   into the plan but never actually read by any adapter). Both now
+//   applied the same way as minScore/maxPopularity below.
+// ==========================================
+
+// ==========================================
+// WATERFALL FIX (this pass): runManga() used to stop at the FIRST source
+// that returned any filtered survivors and return just those, even if
+// that was only 1-2 items — it never went on to ask Jikan/Kitsu/MangaDex
+// for more. That's fine when there's no filter (any single source's page
+// is a complete, useful result), but it actively worked against
+// minScore/maxPopularity/minChapters/maxChapters: a strict filter can
+// legitimately knock a 25-item raw page down to 1-3 survivors, and the
+// waterfall would stop right there instead of topping up from the other
+// three sources. Confirmed live: Hidden Gems and Short Reads were coming
+// back with 1 and 3 results respectively even though other sources likely
+// had more that passed the filter.
+//
+// Now: every source is tried (up to `limit` accumulated results), results
+// are de-duplicated by normalized title (the same manga showing up via
+// both AniList and Jikan, for example, shouldn't appear twice in one
+// row), and only once every source has been tried (or the limit is
+// filled) do we rank + return. Un-filtered queries behave the same as
+// before in practice — the first source's full page usually already
+// satisfies `limit` on its own, so there's nothing left to top up.
+// ==========================================
+
+function parseNumericFilter(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseChapterCount(raw) {
+  if (raw === null || raw === undefined) return null;
+  const n = typeof raw === 'number' ? raw : parseInt(raw, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Applied AFTER a source's raw fetch, BEFORE the waterfall's "did this
+// source return anything usable" check — so a source that gets filtered
+// down to zero results correctly falls through to the next source instead
+// of the waterfall stopping early on an empty-after-filtering page.
+function applyPostFetchFilters(results, filters) {
+  if (!results || results.length === 0) return results;
+
+  const minScore = parseNumericFilter(filters?.minScore);
+  const maxPopularity = parseNumericFilter(filters?.maxPopularity);
+  const minChapters = parseNumericFilter(filters?.minChapters);
+  const maxChapters = parseNumericFilter(filters?.maxChapters);
+
+  if (minScore === null && maxPopularity === null && minChapters === null && maxChapters === null) {
+    return results;
+  }
+
+  return results.filter((r) => {
+    if (minScore !== null) {
+      if (typeof r.averageScore !== 'number' || r.averageScore < minScore) return false;
+    }
+    if (maxPopularity !== null) {
+      if (typeof r.popularity !== 'number' || r.popularity > maxPopularity) return false;
+    }
+    if (minChapters !== null || maxChapters !== null) {
+      const ch = parseChapterCount(r.chapters);
+      if (ch === null) return false;
+      if (minChapters !== null && ch < minChapters) return false;
+      if (maxChapters !== null && ch > maxChapters) return false;
+    }
+    return true;
+  });
+}
+
+// Used by the waterfall to de-duplicate the same manga arriving from two
+// different sources (e.g. AniList and Jikan both surfacing "Berserk").
+// Falls back to the source-qualified id if neither title field is usable,
+// so a genuinely untitled result still gets a stable (if unique) key
+// instead of colliding with every other untitled result.
+function normalizeTitleKey(result) {
+  const title = result?.title?.english || result?.title?.romaji || '';
+  const trimmed = title.trim().toLowerCase();
+  return trimmed || (result?.id != null ? `id:${result.id}` : null);
 }
 
 const MANGA_SOURCES = [
@@ -109,16 +189,6 @@ function applyMoodBoost(results, boostGenres) {
   return scored.map((s) => s.result);
 }
 
-// Wraps classifyQuery()+rankCategories() with the same defensive try/catch
-// pattern computeMoodSignal() already uses above — a classifier failure (or
-// a missing/misconfigured supabase client) should degrade to "no classifier
-// signal" rather than take down the whole request. rankResults() already
-// has its own zero-signal fallback (even 1/3 split), so this is safe.
-//
-// queryGenreTerms are pulled from scores.GENRE.matches / scores.TAG.matches
-// — these are real matched vocab NAMES from lexicon_entities (e.g. "Romance",
-// "Slice of Life"), not raw query words, which is what rankResults()'s
-// genreMatch scoring needs to compare against each candidate's genres[].
 async function computeQueryClassification(supabase, rawQuery) {
   if (!supabase || !rawQuery) return { ranked: [], genreTerms: [] };
   try {
@@ -149,52 +219,72 @@ async function runManga({ query, filters, supabase }) {
     plan.excludedGenres = [...new Set([...(plan.excludedGenres || []), ...routing.excludeGenres])];
   }
 
+  // Accumulate across sources instead of stopping at the first one with
+  // any filtered survivors — see WATERFALL FIX note above.
+  const accumulated = [];
+  const seenTitles = new Set();
+  const contributingSources = [];
+  let anySourceHadFullRawPage = false;
+
   for (const source of MANGA_SOURCES) {
+    if (accumulated.length >= limit) break;
+
     try {
-      let results = await source.fetch(plan, page, limit);
-      if (results && results.length > 0) {
-        if (routing.boostGenres.length > 0) {
-          results = applyMoodBoost(results, routing.boostGenres);
-        }
-        // Final ranking pass — runs after applyMoodBoost()'s soft re-rank,
-        // immediately before returning. Query-adaptive: weights come from
-        // the classifier's own per-query category scores, not a fixed
-        // formula. See §0-NEW9/§0-NEW10 in the Context Log for design +
-        // offline test results (9/9 passed against mock data).
-        results = rankResults(results, {
-          classifierRanked: classification.ranked,
-          moodAggregate: mood ? mood.aggregate : {},
-          queryTokens,
-          queryGenreTerms: classification.genreTerms,
-          filterGenres: filters?.genres ?? [], 
-          boostGenres: routing.boostGenres,
-        });
-        // hasMore is a heuristic, not a real total-count signal from any
-        // adapter: a full page probably means more results exist upstream,
-        // an under-full page means we've hit the end. Same "full page
-        // probably means more" approach the old frontend engine used
-        // (Notion "wiring search engine" Entry 15).
-        const hasMore = results.length === limit;
-        // ADDED 2026-07-17 (Notion "Backend Update List", aiPanel.js gap
-        // #1/#2, Entry 25): expose the routing decision (which genres were
-        // boosted/excluded off the mood signal) and the classifier's ranked
-        // categories + matched genre/tag terms. These were already computed
-        // above for internal ranking use — this just also returns them.
-        // aiPanel.js's "Detected X" / "Avoiding X" reasoning lines have no
-        // other data source; this is additive, nothing existing changes.
-        return {
-          source: source.name,
-          results,
-          mood,
-          page,
-          hasMore,
-          routing,
-          classification,
-        };
+      const rawResults = await source.fetch(plan, page, limit);
+      if (rawResults && rawResults.length === limit) {
+        anySourceHadFullRawPage = true;
       }
+
+      const filteredResults = applyPostFetchFilters(rawResults, filters);
+      if (!filteredResults || filteredResults.length === 0) continue;
+
+      let sourceContributed = false;
+      for (const item of filteredResults) {
+        if (accumulated.length >= limit) break;
+        const key = normalizeTitleKey(item);
+        if (key && seenTitles.has(key)) continue;
+        if (key) seenTitles.add(key);
+        accumulated.push(item);
+        sourceContributed = true;
+      }
+      if (sourceContributed) contributingSources.push(source.name);
     } catch (err) {
       console.error(`[manga] ${source.name} failed`, err);
     }
+  }
+
+  if (accumulated.length > 0) {
+    let results = accumulated;
+    if (routing.boostGenres.length > 0) {
+      results = applyMoodBoost(results, routing.boostGenres);
+    }
+    results = rankResults(results, {
+      classifierRanked: classification.ranked,
+      moodAggregate: mood ? mood.aggregate : {},
+      queryTokens,
+      queryGenreTerms: classification.genreTerms,
+      filterGenres: filters?.genres ?? [], 
+      boostGenres: routing.boostGenres,
+    });
+
+    // hasMore: we filled the page exactly to `limit` AND at least one
+    // contributing source still had a full raw page (there's a
+    // reasonable signal more exists to page into). A partially-filled
+    // page (accumulated.length < limit after trying every source) means
+    // we've genuinely exhausted what's available under this filter, so
+    // hasMore is false in that case even if some individual source had a
+    // full raw page before filtering.
+    const hasMore = accumulated.length >= limit && anySourceHadFullRawPage;
+
+    return {
+      source: contributingSources.join('+') || null,
+      results,
+      mood,
+      page,
+      hasMore,
+      routing,
+      classification,
+    };
   }
 
   return {
