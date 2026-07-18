@@ -7,11 +7,20 @@ import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
-import { classifyQuery, rankCategories } from './parser/queryClassifier.js';
+import { classifyQuery, rankCategories, hasStrongTitleMatch } from './parser/queryClassifier.js';
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
 const MAX_LIMIT = 25;
+
+// Entry 32 fix. Minimum summed emotion-intensity weight (from
+// getRoutingForMood()'s boostGenres) a genre needs before it's trusted
+// enough to actually drive the fetch (genre_in) rather than just re-rank
+// results afterward. Not yet tuned against a broad real-query sample --
+// flagged in Entry 32 as something to validate before this is considered
+// fully safe, same as the TITLE_SIMILARITY_THRESHOLD in queryClassifier.js.
+const MOOD_GENRE_INCLUSION_THRESHOLD = 2;
+const MAX_MOOD_GENRES = 3;
 
 function resolvePagination(filters) {
   const rawPage = Number(filters?.page);
@@ -20,48 +29,6 @@ function resolvePagination(filters) {
   const limit = Number.isInteger(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, MAX_LIMIT) : DEFAULT_LIMIT;
   return { page, limit };
 }
-
-// ==========================================
-// Backend Update List batch (sort/filter additions):
-// - sort:'popularity' — now EXPLICIT and forced across all 4 adapters,
-//   rather than an accidental side-effect of the default branch (which
-//   previously broke for MangaDex on a free-text query — it would use
-//   order[relevance] instead of a popularity order).
-// - sort:'trending' — AniList has a real TRENDING_DESC enum value, so this
-//   is a genuine trending signal there. Jikan/Kitsu/MangaDex have no
-//   trending metric at all, so they fall back to their popularity sort for
-//   this value (documented in each adapter, not silently ignored).
-// - filters.minScore / filters.maxPopularity — NEW. Applied as a
-//   post-fetch filter below (no adapter exposes a clean score/popularity
-//   threshold param across all 4 sources, so this is enforced here rather
-//   than per-adapter, same pattern as the exclude-genre re-check Kitsu
-//   already needed).
-// - filters.minChapters — NEW, filters.maxChapters — FIXED (was accepted
-//   into the plan but never actually read by any adapter). Both now
-//   applied the same way as minScore/maxPopularity below.
-// ==========================================
-
-// ==========================================
-// WATERFALL FIX (this pass): runManga() used to stop at the FIRST source
-// that returned any filtered survivors and return just those, even if
-// that was only 1-2 items — it never went on to ask Jikan/Kitsu/MangaDex
-// for more. That's fine when there's no filter (any single source's page
-// is a complete, useful result), but it actively worked against
-// minScore/maxPopularity/minChapters/maxChapters: a strict filter can
-// legitimately knock a 25-item raw page down to 1-3 survivors, and the
-// waterfall would stop right there instead of topping up from the other
-// three sources. Confirmed live: Hidden Gems and Short Reads were coming
-// back with 1 and 3 results respectively even though other sources likely
-// had more that passed the filter.
-//
-// Now: every source is tried (up to `limit` accumulated results), results
-// are de-duplicated by normalized title (the same manga showing up via
-// both AniList and Jikan, for example, shouldn't appear twice in one
-// row), and only once every source has been tried (or the limit is
-// filled) do we rank + return. Un-filtered queries behave the same as
-// before in practice — the first source's full page usually already
-// satisfies `limit` on its own, so there's nothing left to top up.
-// ==========================================
 
 function parseNumericFilter(value) {
   const n = Number(value);
@@ -74,10 +41,6 @@ function parseChapterCount(raw) {
   return Number.isFinite(n) ? n : null;
 }
 
-// Applied AFTER a source's raw fetch, BEFORE the waterfall's "did this
-// source return anything usable" check — so a source that gets filtered
-// down to zero results correctly falls through to the next source instead
-// of the waterfall stopping early on an empty-after-filtering page.
 function applyPostFetchFilters(results, filters) {
   if (!results || results.length === 0) return results;
 
@@ -107,11 +70,6 @@ function applyPostFetchFilters(results, filters) {
   });
 }
 
-// Used by the waterfall to de-duplicate the same manga arriving from two
-// different sources (e.g. AniList and Jikan both surfacing "Berserk").
-// Falls back to the source-qualified id if neither title field is usable,
-// so a genuinely untitled result still gets a stable (if unique) key
-// instead of colliding with every other untitled result.
 function normalizeTitleKey(result) {
   const title = result?.title?.english || result?.title?.romaji || '';
   const trimmed = title.trim().toLowerCase();
@@ -142,18 +100,50 @@ function buildBasicPlan(query, filters) {
     apiOrder: ['anilist', 'jikan', 'kitsu', 'mangadex'],
     filters: {
       status: filters?.status ?? null,
-      // FIX: this was hardcoded to null, so the `status` value above never
-      // reached any adapter — mangadex.js (and likely anilist.js/jikan.js/
-      // kitsu.js) reads plan.filters.statusFilter specifically. That's why
-      // Trending Today / New Releases (RELEASING) / Most Awaited
-      // (NOT_YET_RELEASED) were all returning identical unfiltered
-      // popularity-sorted results.
       statusFilter: filters?.status ?? null,
       sort: filters?.sort ?? 'relevance',
       maxChapters: filters?.maxChapters ?? null
     },
     confidence: 1.0
   };
+}
+
+// Entry 32 fix. When there's no explicit filter-panel genre selection, no
+// strong title match (Entry 33's hasStrongTitleMatch gate), and the mood
+// pipeline produced boost genres with enough weight to trust, rebuild the
+// plan from those genres via buildPlanFromGenreList() -- same helper the
+// filter-panel path already uses. This flips isGenreSearch to true in every
+// adapter, so a mood query like "I am feeling lonely" becomes a genre_in
+// browse (drama/sliceoflife) instead of a literal keyword search against
+// titles, which is what was producing "I Am No Hero of the Shadows!" and
+// similar mismatches.
+function applyMoodGenreRouting(basicPlan, cleanQuery, filters, routing, classification) {
+  const hasExplicitGenreFilter = Array.isArray(filters?.genres) && filters.genres.length > 0;
+  if (hasExplicitGenreFilter) return basicPlan;
+  if (classification.hasStrongTitleMatch) return basicPlan;
+  if (!routing.boostGenres || routing.boostGenres.length === 0) return basicPlan;
+
+  const topGenres = routing.boostGenres
+    .filter((g) => g.weight >= MOOD_GENRE_INCLUSION_THRESHOLD)
+    .slice(0, MAX_MOOD_GENRES)
+    .map((g) => g.genre);
+
+  if (topGenres.length === 0) return basicPlan;
+
+  const genrePlan = buildPlanFromGenreList(topGenres, { cleanQuery, sort: filters?.sort });
+
+  // buildPlanFromGenreList() defaults status/maxChapters to null -- carry
+  // over whatever the caller actually asked for instead of silently
+  // dropping them, same as buildBasicPlan()'s default branch does.
+  genrePlan.filters.status = filters?.status ?? null;
+  genrePlan.filters.statusFilter = filters?.status ?? null;
+  genrePlan.filters.maxChapters = filters?.maxChapters ?? null;
+  genrePlan.excludedGenres = [...new Set([
+    ...(genrePlan.excludedGenres || []),
+    ...(filters?.excludedGenres ?? [])
+  ])];
+
+  return genrePlan;
 }
 
 async function computeMoodSignal(supabase, rawQuery) {
@@ -196,7 +186,7 @@ function applyMoodBoost(results, boostGenres) {
 }
 
 async function computeQueryClassification(supabase, rawQuery) {
-  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [] };
+  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [], hasStrongTitleMatch: false };
   try {
     const scores = await classifyQuery(supabase, rawQuery);
     const ranked = rankCategories(scores);
@@ -204,10 +194,11 @@ async function computeQueryClassification(supabase, rawQuery) {
       ...(scores.GENRE ? scores.GENRE.matches : []),
       ...(scores.TAG ? scores.TAG.matches : [])
     ];
-    return { ranked, genreTerms };
+    const strongTitleMatch = hasStrongTitleMatch(scores, rawQuery);
+    return { ranked, genreTerms, hasStrongTitleMatch: strongTitleMatch };
   } catch (err) {
     console.error('[domains] query classification failed', err);
-    return { ranked: [], genreTerms: [] };
+    return { ranked: [], genreTerms: [], hasStrongTitleMatch: false };
   }
 }
 
@@ -219,36 +210,15 @@ async function runManga({ query, filters, supabase }) {
   const classification = await computeQueryClassification(supabase, query || '');
   const { page, limit } = resolvePagination(filters);
 
-  const plan = buildBasicPlan(cleanQuery, filters);
+  let plan = buildBasicPlan(cleanQuery, filters);
+  plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification);
 
   if (routing.excludeGenres.length > 0) {
     plan.excludedGenres = [...new Set([...(plan.excludedGenres || []), ...routing.excludeGenres])];
   }
 
-  // moodMatchedTerms: analyzeQueryMood()'s perToken hits (e.g. "cozy",
-  // "heartwarming", "slow burn"), already computed above via
-  // computeMoodSignal() — no new fetch. Passed through to rankResults() so
-  // it has a fallback discriminator available for the saturation case (see
-  // rankResults.js's 2026-07-18 fix note) without needing any new data
-  // source. Deliberately a plain array (or []), not re-derived here.
   const moodMatchedTerms = mood ? mood.matchedTerms : [];
 
-  // FAN-OUT MODE (Notion "Backend Update List", multi-source fan-out
-  // request): Advanced Filter's fetchAll.js used to genuinely query all 4
-  // sources in parallel and hand each source's results to merge.js
-  // separately — the waterfall-stop-at-first-hit behavior above collapsed
-  // that into "whichever single source answered first", which merge.js
-  // can still consume (it only needs the {source, items}[] shape) but
-  // with 3 of 4 buckets always empty, so results felt thinner.
-  //
-  // Opt-in via filters.fanOut (boolean) so every other caller — landing
-  // page rows, Mixer, plain search — keeps the existing waterfall
-  // behavior and its early-exit performance benefit unchanged. When set,
-  // all 4 adapters are queried concurrently (Promise.allSettled, so one
-  // slow/failed source never blocks the others), each source's own
-  // post-fetch-filtered results are kept in their own bucket
-  // (bySource.<name>), and nothing is capped/deduped across sources here
-  // — that's merge.js's job, same as before the engine cutover.
   const fanOut = !!filters?.fanOut;
 
   if (fanOut) {
@@ -270,10 +240,6 @@ async function runManga({ query, filters, supabase }) {
       bySource[source.name] = applyPostFetchFilters(rawResults, filters) || [];
     });
 
-    // Still provide a single merged/ranked `results` list too, so any
-    // caller that doesn't care about per-source buckets (or an older
-    // frontend build that hasn't picked up bySource yet) keeps working
-    // exactly like the non-fanOut path.
     const seenTitlesFO = new Set();
     const mergedFO = [];
     for (const source of MANGA_SOURCES) {
@@ -315,8 +281,6 @@ async function runManga({ query, filters, supabase }) {
     };
   }
 
-  // Accumulate across sources instead of stopping at the first one with
-  // any filtered survivors — see WATERFALL FIX note above.
   const accumulated = [];
   const seenTitles = new Set();
   const contributingSources = [];
@@ -364,13 +328,6 @@ async function runManga({ query, filters, supabase }) {
       moodMatchedTerms,
     });
 
-    // hasMore: we filled the page exactly to `limit` AND at least one
-    // contributing source still had a full raw page (there's a
-    // reasonable signal more exists to page into). A partially-filled
-    // page (accumulated.length < limit after trying every source) means
-    // we've genuinely exhausted what's available under this filter, so
-    // hasMore is false in that case even if some individual source had a
-    // full raw page before filtering.
     const hasMore = accumulated.length >= limit && anySourceHadFullRawPage;
 
     return {
