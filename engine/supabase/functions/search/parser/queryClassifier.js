@@ -1,5 +1,5 @@
 import { getAfinnScore } from './dictionary/afinn.js';
-import { normalizeAndTokenize, normalize } from './normalize.js';
+import { normalizeAndTokenize, normalize } from './normalize.js'; 
 import { similarity } from './fuzzyMatch.js';
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
