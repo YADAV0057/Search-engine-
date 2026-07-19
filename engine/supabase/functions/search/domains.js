@@ -1,13 +1,13 @@
 import { normalize, normalizeAndTokenize } from './parser/normalize.js';  
 import { buildPlanFromGenreList } from './parser/searchPlanner.js';
-import { fetchFromAniListUnified, fetchAniListMediaBySearch, fetchAniListRecommendations } from './adapters/anilist.js';
+import { fetchFromAniListUnified, fetchAniListMediaBySearch, fetchAniListRecommendations, fetchAniListMediaByTags } from './adapters/anilist.js';
 import { fetchFromJikanFallback } from './adapters/jikan.js';
 import { fetchFromKitsuFallback } from './adapters/kitsu.js';
 import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood, detectConjunctiveClusters } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
-import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms } from './parser/queryClassifier.js';
+import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms, getTagVocabEntries, significantTokens } from './parser/queryClassifier.js';
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
 import { detectReferenceTitle } from './parser/referenceTitle.js';
 import { getEmotionalIntentFallback } from './parser/emotionalIntentFallback.js';
@@ -322,6 +322,64 @@ async function resolveReferenceTitle(reference, cleanQuery, filters) {
   }
 }
 
+// Entry 59 fix (Notion "Backend Update List"): closes the gap diagnosed
+// after Entry 57/58 -- those fixes made the mood pipeline generate real
+// per-query keywords and made rankResults.js able to use them for
+// re-ranking, but the FETCH stage never used them at all, so every
+// "comfort" query still browsed the same fixed genre_in candidate pool
+// (re-ranking a fixed pool can't surface a title that was never fetched).
+// This function is what actually diversifies the pool: it matches the
+// mood signal's keywords against REAL, curated AniList tag names (never
+// passes raw LLM phrasing straight to AniList -- see
+// fetchAniListMediaByTags()'s header) and, on a hit, fetches by tag_in --
+// the same "confirm against real vocab first, then fetch" shape
+// resolveReferenceTitle() above already uses for "like X" references.
+//
+// Matching is deliberately the same word-bag overlap queryClassifier.js's
+// matchesCategoryPhrase() uses for TITLE candidates (>=1 shared
+// significant/4+ letter token), just applied to short LLM keyword phrases
+// against tag names instead of full query tokens against title names --
+// appropriate here because both sides are already short, specific phrases
+// (2-4 words), not a full sentence that would need the stricter
+// similarity() check hasStrongTitleMatch() applies for TITLE.
+async function resolveMoodTagCandidates(supabase, moodMatchedTerms) {
+  if (!moodMatchedTerms || moodMatchedTerms.length === 0) return { results: [], matchedTags: [] };
+
+  try {
+    const tagEntries = await getTagVocabEntries(supabase);
+    if (!tagEntries || tagEntries.length === 0) return { results: [], matchedTags: [] };
+
+    const matchedTags = new Set();
+    for (const { term } of moodMatchedTerms) {
+      const termTokens = significantTokens(term || '');
+      if (termTokens.length === 0) continue;
+      const termTokenSet = new Set(termTokens);
+
+      for (const entry of tagEntries) {
+        if (matchedTags.has(entry.name)) continue;
+        if (entry.tokens.some((t) => termTokenSet.has(t))) {
+          matchedTags.add(entry.name);
+        }
+      }
+    }
+
+    if (matchedTags.size === 0) return { results: [], matchedTags: [] };
+
+    // Cap at 3 tags -- AniList's tag_in is an OR match across the list, so
+    // adding more tags widens the pool rather than narrowing it. 3 keeps
+    // the browse thematically tight, same reasoning as MAX_MOOD_GENRES
+    // above for genre boosting. Not yet tuned against a broad real-query
+    // sample -- flagged the same way MOOD_GENRE_INCLUSION_THRESHOLD/
+    // TITLE_SIMILARITY_THRESHOLD were, as something to validate later.
+    const tagsToQuery = [...matchedTags].slice(0, 3);
+    const results = await fetchAniListMediaByTags(tagsToQuery, 15);
+    return { results, matchedTags: tagsToQuery };
+  } catch (err) {
+    console.error('[manga] mood tag candidate resolution failed', err);
+    return { results: [], matchedTags: [] };
+  }
+}
+
 async function runManga({ query, filters, supabase }) {
   const cleanQuery = normalize(query || '');
   const queryTokens = normalizeAndTokenize(query || '');
@@ -419,6 +477,16 @@ async function runManga({ query, filters, supabase }) {
 
   const fanOut = !!filters?.fanOut;
 
+  // Entry 59 fix. Skipped in fan-out mode for the same reason referenceTitle
+  // is (Advanced Filter's filters-only request shape has no free text for
+  // the mood pipeline to have generated keywords from in the first place --
+  // moodMatchedTerms is already empty by construction there, so this call
+  // would be a guaranteed no-op; not calling it at all avoids an
+  // unnecessary warmCache()/AniList round trip on that path).
+  const moodTagResolution = fanOut
+    ? { results: [], matchedTags: [] }
+    : await resolveMoodTagCandidates(supabase, moodMatchedTerms);
+
   if (fanOut) {
     const bySource = { anilist: [], jikan: [], kitsu: [], mangadex: [] };
     let anySourceHadFullRawPageFO = false;
@@ -486,6 +554,7 @@ async function runManga({ query, filters, supabase }) {
       // consistency with the normal path below rather than omitting the
       // key entirely.
       referenceTitle: null,
+      moodTags: null,
     };
   }
 
@@ -515,6 +584,28 @@ async function runManga({ query, filters, supabase }) {
       contributed = true;
     }
     if (contributed) contributingSources.push('anilist-recommendations');
+  }
+
+  // Entry 59 fix. Seeded second -- after the higher-precision "like X"
+  // reference-title recommendations (a confirmed specific-title match beats
+  // a broader mood/tag match), before the generic genre_in waterfall. Same
+  // additive shape as the block above: dedup by title, stop once `limit`
+  // is hit, contributes its own named source rather than being folded into
+  // an existing one so aiPanel.js's reasoning trail (and this response's
+  // `source` field) can show a "comfort" query actually pulled from
+  // AniList's tag_in browse rather than the plain genre waterfall.
+  if (moodTagResolution.results && moodTagResolution.results.length > 0) {
+    const filtered = applyPostFetchFilters(moodTagResolution.results, filters) || [];
+    let contributed = false;
+    for (const item of filtered) {
+      if (accumulated.length >= limit) break;
+      const key = normalizeTitleKey(item);
+      if (key && seenTitles.has(key)) continue;
+      if (key) seenTitles.add(key);
+      accumulated.push(item);
+      contributed = true;
+    }
+    if (contributed) contributingSources.push('anilist-mood-tags');
   }
 
   for (const source of MANGA_SOURCES) {
@@ -561,6 +652,12 @@ async function runManga({ query, filters, supabase }) {
       }
     : null;
 
+  // Entry 59 response metadata -- same reasoning as referenceTitle just
+  // above: null whenever no tag match fired (the overwhelming majority of
+  // non-mood queries, and any mood query whose keywords didn't overlap the
+  // ~420-tag vocab), so this is additive-only for existing callers.
+  const moodTags = moodTagResolution.matchedTags.length > 0 ? moodTagResolution.matchedTags : null;
+
   if (accumulated.length > 0) {
     let results = accumulated;
     if (routing.boostGenres.length > 0) {
@@ -590,6 +687,7 @@ async function runManga({ query, filters, supabase }) {
       classification,
       acclaim,
       referenceTitle,
+      moodTags,
     };
   }
 
@@ -603,6 +701,7 @@ async function runManga({ query, filters, supabase }) {
     classification,
     referenceTitle,
     acclaim,
+    moodTags,
   };
 }
 
