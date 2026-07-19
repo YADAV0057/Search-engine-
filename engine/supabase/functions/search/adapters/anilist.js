@@ -197,8 +197,18 @@ function buildReleaseDate(startDate) {
     return `${startDate.year}-${String(startDate.month || 1).padStart(2, '0')}-${String(startDate.day || 1).padStart(2, '0')}`;
 }
 
+// Entry 66 (2026-07-19, by Claude): added `tags { name rank }`. AniList's
+// own ~420 curated tags (Found Family, Boarding School, Steampunk...) were
+// already being used to build the FETCH pool (Entry 59's
+// fetchAniListMediaByTags()/resolveMoodTagCandidates()) but were never
+// requested back on the candidate objects themselves, so rankResults.js's
+// scoring stage had no choice but to fall back to the coarse 14-genre
+// proxy for every candidate, discarding the exact precision the fetch
+// stage just paid for. `rank` is AniList's own 0-100 per-title confidence
+// for that tag -- a free, high-precision replacement for the manual
+// weight-fan-out math tagMatchScore() used to have to approximate.
 const MEDIA_FIELDS = `
-    id title { romaji english } averageScore genres description(asHtml: false) coverImage { large } chapters status popularity startDate { year month day }
+    id title { romaji english } averageScore genres tags { name rank } description(asHtml: false) coverImage { large } chapters status popularity startDate { year month day }
     staff(sort: RELEVANCE, perPage: 3) { edges { role node { name { full } } } }
 `;
 
