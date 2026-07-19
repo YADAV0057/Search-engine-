@@ -163,10 +163,19 @@ async function writeBackToLexicon(supabase, query, groqScore) {
   const intensity = Math.round(groqScore * 10);
 
   try {
+    // Entry 60 fix (Notion "Backend Update List"): scoped by entity_type,
+    // symmetric with emotionalIntentFallback.js's own fix -- this fetch
+    // previously pulled in and merged whatever entity_type='mood_word' row
+    // existed for the same normalized_term, corrupting `emotions` with a
+    // key this feature never intended to write there. See that file's
+    // writeBackToLexicon() for the full repro and the migration that added
+    // the composite (normalized_term, entity_type) unique constraint this
+    // now targets via onConflict below.
     const { data: existing, error: fetchErr } = await supabase
       .from('manga_emotion_lexicon')
       .select('emotions')
       .eq('normalized_term', term)
+      .eq('entity_type', 'acclaim_phrase')
       .maybeSingle();
 
     if (fetchErr) {
@@ -180,7 +189,7 @@ async function writeBackToLexicon(supabase, query, groqScore) {
       .from('manga_emotion_lexicon')
       .upsert(
         { term, normalized_term: term, entity_type: 'acclaim_phrase', emotions, source: 'groq_acclaim_writeback' },
-        { onConflict: 'normalized_term' }
+        { onConflict: 'normalized_term,entity_type' }
       );
 
     if (upsertErr) {
