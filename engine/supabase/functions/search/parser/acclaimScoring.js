@@ -179,7 +179,7 @@ async function writeBackToLexicon(supabase, query, groqScore) {
     const { error: upsertErr } = await supabase
       .from('manga_emotion_lexicon')
       .upsert(
-        { normalized_term: term, emotions, source: 'groq_acclaim_writeback' },
+        { term, normalized_term: term, entity_type: 'acclaim_phrase', emotions, source: 'groq_acclaim_writeback' },
         { onConflict: 'normalized_term' }
       );
 
