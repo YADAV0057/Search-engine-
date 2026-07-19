@@ -230,7 +230,7 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
     const { error: upsertErr } = await supabase
       .from('manga_emotion_lexicon')
       .upsert(
-        { normalized_term: term, emotions, source: `emotional_intent_writeback:${provider}` },
+        { term, normalized_term: term, entity_type: 'mood_word', emotions, source: `emotional_intent_writeback:${provider}` },
         { onConflict: 'normalized_term' }
       );
 
