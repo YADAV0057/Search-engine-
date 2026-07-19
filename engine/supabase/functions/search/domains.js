@@ -261,7 +261,7 @@ async function runManga({ query, filters, supabase }) {
   // paraphrased acclaim language the lexicon wasn't seeded for. Fails
   // closed to { intensity: 0, source: null } on any error/missing key, so
   // this can never block or degrade a search that isn't asking for it.
-  const acclaim = await computeAcclaimIntensity(mood, query || '', Deno.env.get('GROQ_API_KEY'));
+  const acclaim = await computeAcclaimIntensity(mood, query || '', Deno.env.get('GROQ_API_KEY'), supabase);
   const { page, limit } = resolvePagination(filters);
 
   let plan = buildBasicPlan(cleanQuery, filters);
