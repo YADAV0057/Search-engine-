@@ -242,7 +242,7 @@ function scheduleWriteBack(promise) {
  * runs after the response is already sent, same as acclaimScoring.js's
  * writeBackToLexicon().
  */
-async function writeBackToLexicon(supabase, query, emotionKey, provider) {
+async function writeBackToLexicon(supabase, query, emotionKey, keywords, provider) {
   if (!supabase || !query || !emotionKey) return;
 
   const term = normalize(query).trim();
@@ -251,7 +251,7 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
   try {
     const { data: existing, error: fetchErr } = await supabase
       .from('manga_emotion_lexicon')
-      .select('emotions')
+      .select('emotions, keywords')
       .eq('normalized_term', term)
       .maybeSingle();
 
@@ -262,10 +262,26 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
 
     const emotions = { ...(existing?.emotions || {}), [emotionKey]: FALLBACK_INTENSITY };
 
+    // Entry 58 fix: merge (dedupe) rather than overwrite -- if a later
+    // classification of the exact same phrase returns slightly different
+    // keyword phrasing, keep the union instead of discarding whichever set
+    // landed first. Falls back to [] for rows written before this column
+    // existed (Postgres returns [] as the column default, but guard anyway
+    // in case `existing.keywords` is null for any other reason).
+    const existingKeywords = Array.isArray(existing?.keywords) ? existing.keywords : [];
+    const mergedKeywords = [...new Set([...existingKeywords, ...(keywords || [])])];
+
     const { error: upsertErr } = await supabase
       .from('manga_emotion_lexicon')
       .upsert(
-        { term, normalized_term: term, entity_type: 'mood_word', emotions, source: `emotional_intent_writeback:${provider}` },
+        {
+          term,
+          normalized_term: term,
+          entity_type: 'mood_word',
+          emotions,
+          keywords: mergedKeywords,
+          source: `emotional_intent_writeback:${provider}`,
+        },
         { onConflict: 'normalized_term' }
       );
 
@@ -274,6 +290,63 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
     }
   } catch (err) {
     console.error('[emotionalIntentFallback] lexicon writeback threw', err);
+  }
+}
+
+/**
+ * Entry 58 fix: an exact-phrase check against manga_emotion_lexicon for a
+ * row this module itself wrote back previously. This is deliberately
+ * separate from -- and runs before -- analyzeQueryMood()'s own lexicon
+ * read (moodLexicon.js), because that function only matches candidate
+ * phrases up to MAX_PHRASE_WORDS (4) tokens. A full-sentence row written
+ * by writeBackToLexicon() below is normalized_term = the entire raw query,
+ * which for any query longer than 4 words -- the common case for anything
+ * that reaches this fallback at all -- can never appear in
+ * analyzeQueryMood()'s candidate-phrase list. Without this check, the
+ * write-back closed the *schema* gap (keywords now persist) but not the
+ * *reachability* gap: a repeat of the exact same sentence would still
+ * silently re-call analyzeQueryMood() (empty), then re-pay for Groq/
+ * Cerebras every single time, exactly as before Entry 56/57 -- the
+ * write-back's entire purpose (Entry 47: "Groq call volume should trend
+ * toward zero over time") would still not hold for this fallback's own
+ * rows specifically.
+ *
+ * Scoped with entity_type + source LIKE guards so this only ever matches a
+ * row this exact function tree wrote, never an unrelated custom_lexicon
+ * phrase entry that happens to share a normalized_term.
+ */
+async function getWrittenBackClassification(supabase, term) {
+  if (!supabase || !term) return null;
+
+  try {
+    const { data, error } = await supabase
+      .from('manga_emotion_lexicon')
+      .select('emotions, keywords')
+      .eq('normalized_term', term)
+      .eq('entity_type', 'mood_word')
+      .like('source', 'emotional_intent_writeback%')
+      .maybeSingle();
+
+    if (error) {
+      console.error('[emotionalIntentFallback] cached classification lookup failed', error);
+      return null;
+    }
+    if (!data || !data.emotions) return null;
+
+    const emotionKeys = Object.keys(data.emotions);
+    if (emotionKeys.length === 0) return null;
+
+    // This module's writeBackToLexicon() only ever sets one key per call,
+    // but merges into whatever was already there (see above) -- take the
+    // first key rather than assuming a specific one if a row somehow ends
+    // up holding more than one (e.g. hand-edited, or written by another
+    // feature sharing this table).
+    const emotionKey = emotionKeys[0];
+    const keywords = Array.isArray(data.keywords) ? data.keywords : [];
+    return { emotionKey, keywords };
+  } catch (err) {
+    console.error('[emotionalIntentFallback] cached classification lookup threw', err);
+    return null;
   }
 }
 
@@ -303,10 +376,26 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
 export async function getEmotionalIntentFallback(rawQuery, tokens, groqApiKey, cerebrasApiKey, supabase) {
   if (!hasMeaningfulContent(tokens)) return null;
 
+  const term = normalize(rawQuery).trim();
+
+  // Entry 58: exact-phrase cache check, ahead of the LLM call. See
+  // getWrittenBackClassification()'s own comment for why this can't just
+  // rely on analyzeQueryMood() having already found (and ruled out) a
+  // match -- that function's phrase matching structurally cannot reach a
+  // full-sentence write-back row for any query over 4 words.
+  const cached = await getWrittenBackClassification(supabase, term);
+  if (cached) {
+    const aggregate = { [cached.emotionKey]: FALLBACK_INTENSITY };
+    const matchedTerms = cached.keywords.length > 0
+      ? cached.keywords.map((kw) => ({ term: kw, emotions: aggregate, source: 'emotional_intent_writeback:cache' }))
+      : [{ term, emotions: aggregate, source: 'emotional_intent_writeback:cache' }];
+    return { aggregate, negatedAggregate: {}, matchedTerms };
+  }
+
   const { emotionKey, keywords, provider } = await classifyEmotionalIntent(rawQuery, groqApiKey, cerebrasApiKey);
   if (!emotionKey) return null;
 
-  scheduleWriteBack(writeBackToLexicon(supabase, rawQuery, emotionKey, provider));
+  scheduleWriteBack(writeBackToLexicon(supabase, rawQuery, emotionKey, keywords, provider));
 
   const aggregate = { [emotionKey]: FALLBACK_INTENSITY };
 
@@ -332,6 +421,13 @@ export async function getEmotionalIntentFallback(rawQuery, tokens, groqApiKey, c
   // Falls back to the old single-full-sentence term if the model replied
   // with just a bare key and no keywords (e.g. an older/drifted reply) --
   // strictly no worse than before in that case, not a regression.
+  //
+  // UPDATED Entry 58: this fresh-classification path now also persists
+  // `keywords` (see writeBackToLexicon()) and getWrittenBackClassification()
+  // above reads them back on an exact-phrase repeat, so the keyword-level
+  // distinction survives a cache hit too -- previously flagged as a known
+  // limitation here ("only helps fresh LLM classifications, not lexicon-hit
+  // repeats"), now closed.
   const matchedTerms = keywords.length > 0
     ? keywords.map((term) => ({ term, emotions: aggregate, source: `emotional_intent_fallback:${provider}` }))
     : [{ term: normalize(rawQuery).trim(), emotions: aggregate, source: `emotional_intent_fallback:${provider}` }];
