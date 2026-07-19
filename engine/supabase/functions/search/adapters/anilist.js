@@ -16,6 +16,47 @@
 // Jikan/Kitsu/MangaDex results simply have no `staff` property on their
 // raw media objects, so resultNormalizer.js's extraction resolves to null
 // for those sources -- no adapter-specific branching needed there.
+// FIX 2026-07-19 (Notion "Backend Update List" Entry 52): mangaRouting.js's
+// MANGA_ROUTING table (and therefore routing.boostGenres/excludeGenres,
+// which flow into plan.primaryGenres/excludedGenres via
+// domains.js's applyMoodGenreRouting()/exclusion pass) is keyed off
+// VALID_ROUTING_GENRES -- lowercase, no-space strings like 'sliceoflife',
+// 'scifi'. AniList's actual genre enum values are Title Case with spaces/
+// hyphens ("Slice of Life", "Sci-Fi"). Sending 'sliceoflife' straight into
+// genre_in/genre_not_in matches nothing on AniList specifically -- boosts
+// silently return empty (harmlessly falls through to Jikan/Kitsu, which DO
+// normalize case), but excludes silently return an unfiltered, non-empty
+// POPULARITY_DESC browse, which stops the waterfall right there and lets
+// the "excluded" genre through with the highest-confidence badges in the
+// result set (repro: "No tragedy" -> Tokyo Ghoul 100%, Death Note 98%).
+// This is the same normalization pattern as searchPlanner.js's existing
+// GENRE_NORMALIZE, just keyed off VALID_ROUTING_GENRES's lowercase forms
+// instead of PascalCase ones. Genre names that already arrive correctly
+// cased (explicit filter-panel selections via buildPlanFromGenreList(),
+// reference-title genres via resolveReferenceTitle(), real GENRE/TAG
+// vocab matches via Entry 53's fix) simply aren't in this map and pass
+// through unchanged.
+const ROUTING_KEY_TO_ANILIST_GENRE = {
+    action: 'Action',
+    adventure: 'Adventure',
+    comedy: 'Comedy',
+    drama: 'Drama',
+    fantasy: 'Fantasy',
+    horror: 'Horror',
+    mystery: 'Mystery',
+    psychological: 'Psychological',
+    romance: 'Romance',
+    scifi: 'Sci-Fi',
+    sliceoflife: 'Slice of Life',
+    sports: 'Sports',
+    supernatural: 'Supernatural',
+    thriller: 'Thriller'
+};
+
+function toAniListGenre(name) {
+    return ROUTING_KEY_TO_ANILIST_GENRE[name] || name;
+}
+
 /**
  * @param {import('./parser/searchPlanner.js').SearchPlan} plan
  * @param {number} page
@@ -35,7 +76,7 @@ export async function fetchFromAniListUnified(plan, page = 1, isKorean = false, 
     // secondary themes (both are AniList genre strings post-normalization —
     // AniList doesn't distinguish "genre" from "theme" the way our intent
     // object does, so we search on the union of both).
-    const genreList = [...(plan.primaryGenres || []), ...(plan.secondaryThemes || [])];
+    const genreList = [...(plan.primaryGenres || []), ...(plan.secondaryThemes || [])].map(toAniListGenre);
     const isGenreSearch = genreList.length > 0;
     const freeText = (plan.cleanQuery || '').trim();
 
@@ -52,10 +93,11 @@ export async function fetchFromAniListUnified(plan, page = 1, isKorean = false, 
 
     // NEW: exclude genres the planner determined should be avoided (mood-based
     // avoids + explicit "no romance"-style negations, per ruleEngine.js/pipeline.js)
+    // Entry 52 fix: run through toAniListGenre() -- see comment above.
     if (plan.excludedGenres && plan.excludedGenres.length > 0) {
         queryArgs += `, $excludedGenres: [String]`;
         mediaArgs += `, genre_not_in: $excludedGenres`;
-        variables.excludedGenres = plan.excludedGenres;
+        variables.excludedGenres = plan.excludedGenres.map(toAniListGenre);
     }
 
     if (plan.filters?.statusFilter) {
