@@ -25,6 +25,25 @@
 // waiting on that infra, using a model call instead of a vector compare.
 // Worth swapping for real embeddings later if/when Entry 31's mood-
 // embedding infra gets built, since one shared semantic layer beats two.
+//
+// ADDED: lexicon write-back. A Groq call that confidently classifies a
+// paraphrase gets written into manga_emotion_lexicon so the NEXT time
+// anyone searches that phrasing (even after the 6-hour search_cache TTL
+// expires, even for a different user), it's picked up by the free lexicon
+// tier and Groq never gets called for it again. This is the difference
+// between "pay for the same Groq call forever" and "pay once per novel
+// phrase" -- the lexicon only ever grows, so the Groq-call rate for
+// acclaim-intent queries should trend toward zero as it fills in over
+// time, for whatever phrasings people actually use.
+//
+// Gated on confidence (see WRITEBACK_THRESHOLD below) for a reason: an
+// unsure Groq guess going into the lexicon would misclassify every future
+// query matching that exact phrase, permanently, for free -- a bad
+// tradeoff versus just paying for Groq again next time. Runs via
+// EdgeRuntime.waitUntil() so it never adds latency to the search response
+// itself; it's a best-effort side effect, not part of the request's
+// critical path.
+import { normalize } from './normalize.js';
 
 const ACCLAIM_SATURATION = 8; // same saturating-cap pattern as
                                // rankResults.js's MOOD_INTENSITY_SATURATION
@@ -37,6 +56,9 @@ const GROQ_MODEL = 'llama-3.1-8b-instant'; // this is a single-integer
                                             // classification, not
                                             // generation -- smallest/fastest
                                             // Groq model is the right choice
+const WRITEBACK_THRESHOLD = 0.5; // groqScore >= 5/10 -- confident enough to
+                                  // trust as ground truth for future
+                                  // queries. Below this, write nothing.
 
 function normalizeLexiconIntensity(mood) {
   const raw = mood?.aggregate?.acclaim;
@@ -101,16 +123,89 @@ async function callGroqForAcclaimIntent(query, apiKey) {
 }
 
 /**
+ * Fires the write-back promise without making the caller wait on it.
+ * EdgeRuntime.waitUntil() (Supabase Edge Functions' background-task API)
+ * keeps the isolate alive long enough for it to finish AFTER the response
+ * has already been sent to the user -- so this adds zero latency to their
+ * search. Falls back to a bare fire-and-forget outside that runtime (e.g.
+ * local `deno run` testing) so this file doesn't hard-depend on it.
+ */
+function scheduleWriteBack(promise) {
+  if (typeof EdgeRuntime !== 'undefined' && EdgeRuntime.waitUntil) {
+    EdgeRuntime.waitUntil(promise);
+  } else {
+    promise.catch((err) => {
+      console.error('[acclaimScoring] lexicon writeback failed (no EdgeRuntime)', err);
+    });
+  }
+}
+
+/**
+ * Upserts a confident Groq classification into manga_emotion_lexicon so
+ * future exact-phrase matches are free (lexicon tier) instead of another
+ * Groq call. Merges into any existing emotions row rather than overwriting
+ * it, so a phrase that already carries other emotion signal keeps it.
+ *
+ * Deliberately swallows every error here -- this is a best-effort cache-
+ * warming side effect running after the response is already sent. It must
+ * never be able to surface a failure to the user, and by the time this
+ * runs there's no response left to attach an error to anyway.
+ */
+async function writeBackToLexicon(supabase, query, groqScore) {
+  if (!supabase || !query) return;
+
+  const term = normalize(query).trim();
+  if (!term) return;
+
+  // Back to the lexicon's native ~0-10 scale (matches existing rows like
+  // "critically acclaimed" -> 7), rather than the 0-1 scale used
+  // internally for blending.
+  const intensity = Math.round(groqScore * 10);
+
+  try {
+    const { data: existing, error: fetchErr } = await supabase
+      .from('manga_emotion_lexicon')
+      .select('emotions')
+      .eq('normalized_term', term)
+      .maybeSingle();
+
+    if (fetchErr) {
+      console.error('[acclaimScoring] lexicon writeback lookup failed', fetchErr);
+      return;
+    }
+
+    const emotions = { ...(existing?.emotions || {}), acclaim: intensity };
+
+    const { error: upsertErr } = await supabase
+      .from('manga_emotion_lexicon')
+      .upsert(
+        { normalized_term: term, emotions, source: 'groq_acclaim_writeback' },
+        { onConflict: 'normalized_term' }
+      );
+
+    if (upsertErr) {
+      console.error('[acclaimScoring] lexicon writeback upsert failed', upsertErr);
+    }
+  } catch (err) {
+    console.error('[acclaimScoring] lexicon writeback threw', err);
+  }
+}
+
+/**
  * Main entry point. Returns { intensity: 0-1, source: string|null }.
  *
  * mood: the object domains.js already computed via computeMoodSignal()
  *   (may be null for a filters-only browse -- handled below, degrades to
  *   { intensity: 0, source: null } rather than throwing).
- * query: the raw query string, used only for the Groq fallback tier.
+ * query: the raw query string, used for the Groq fallback tier AND as the
+ *   lexicon key on write-back.
  * groqApiKey: Deno.env.get('GROQ_API_KEY') -- optional. When absent this
  *   silently degrades to lexicon-only and never throws.
+ * supabase: the request's Supabase client, used only for the write-back.
+ *   Optional -- when absent, write-back is silently skipped (still returns
+ *   the Groq result for THIS request, it just doesn't get remembered).
  */
-async function computeAcclaimIntensity(mood, query, groqApiKey) {
+async function computeAcclaimIntensity(mood, query, groqApiKey, supabase) {
   const lexiconIntensity = normalizeLexiconIntensity(mood);
   const lexiconRaw = mood?.aggregate?.acclaim ?? 0;
 
@@ -124,6 +219,10 @@ async function computeAcclaimIntensity(mood, query, groqApiKey) {
     return lexiconRaw > 0
       ? { intensity: lexiconIntensity, source: 'lexicon' }
       : { intensity: 0, source: null };
+  }
+
+  if (groqScore >= WRITEBACK_THRESHOLD) {
+    scheduleWriteBack(writeBackToLexicon(supabase, query, groqScore));
   }
 
   const blended = Math.max(lexiconIntensity, groqScore);
@@ -179,4 +278,3 @@ function computeQualityScores(results) {
 }
 
 export { computeAcclaimIntensity, computeQualityScores };
-
