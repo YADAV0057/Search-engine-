@@ -1,6 +1,6 @@
 import { normalize, normalizeAndTokenize } from './parser/normalize.js';  
 import { buildPlanFromGenreList } from './parser/searchPlanner.js';
-import { fetchFromAniListUnified } from './adapters/anilist.js';
+import { fetchFromAniListUnified, fetchAniListMediaBySearch, fetchAniListRecommendations } from './adapters/anilist.js';
 import { fetchFromJikanFallback } from './adapters/jikan.js';
 import { fetchFromKitsuFallback } from './adapters/kitsu.js';
 import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
@@ -9,6 +9,7 @@ import { getRoutingForMood, detectConjunctiveClusters } from './parser/mangaRout
 import { rankResults } from './parser/rankResults.js';
 import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms } from './parser/queryClassifier.js';
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
+import { detectReferenceTitle } from './parser/referenceTitle.js';
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -245,6 +246,53 @@ async function computeQueryClassification(supabase, rawQuery) {
   }
 }
 
+// Entry 49 gap #4. Only called when referenceTitle.js has already
+// confirmed a "like X" mention against the real TITLE vocab (see that
+// file's header for why the confirmation step exists) -- this function
+// just resolves the confirmed title to AniList data and decides what to
+// hand back to runManga(). Three outcomes, in order of preference:
+//   1. AniList resolves the title AND has curated recommendations for it
+//      -> those recommendations become the candidate pool directly.
+//   2. AniList resolves the title but has zero/thin recommendations
+//      (common for obscure or very new titles) -> fall back to a
+//      genre_in plan built from that title's OWN genres, same
+//      buildPlanFromGenreList() helper the mood-routing path already
+//      uses -- weaker than #1 (loses the "specifically like THIS title"
+//      precision) but still anchored to the actual reference instead of
+//      ignoring it.
+//   3. AniList can't resolve the title at all (rare, since it already
+//      matched something in lexicon_entities) -> null, caller proceeds
+//      exactly as if no reference had been detected.
+async function resolveReferenceTitle(reference, cleanQuery, filters) {
+  if (!reference) return { results: null, plan: null, resolvedMedia: null };
+
+  try {
+    const media = await fetchAniListMediaBySearch(reference.title);
+    if (!media) return { results: null, plan: null, resolvedMedia: null };
+
+    const recommendations = await fetchAniListRecommendations(media.id, 15);
+    if (recommendations.length > 0) {
+      return { results: recommendations, plan: null, resolvedMedia: media };
+    }
+
+    if (media.genres && media.genres.length > 0) {
+      const genrePlan = buildPlanFromGenreList(media.genres.slice(0, 3), {
+        cleanQuery,
+        sort: filters?.sort
+      });
+      genrePlan.filters.status = filters?.status ?? null;
+      genrePlan.filters.statusFilter = filters?.status ?? null;
+      genrePlan.filters.maxChapters = filters?.maxChapters ?? null;
+      return { results: null, plan: genrePlan, resolvedMedia: media };
+    }
+
+    return { results: null, plan: null, resolvedMedia: media };
+  } catch (err) {
+    console.error('[manga] reference-title resolution failed', err);
+    return { results: null, plan: null, resolvedMedia: null };
+  }
+}
+
 async function runManga({ query, filters, supabase }) {
   const cleanQuery = normalize(query || '');
   const queryTokens = normalizeAndTokenize(query || '');
@@ -277,8 +325,20 @@ async function runManga({ query, filters, supabase }) {
   const acclaim = await computeAcclaimIntensity(mood, query || '', Deno.env.get('GROQ_API_KEY'), supabase);
   const { page, limit } = resolvePagination(filters);
 
-  let plan = buildBasicPlan(cleanQuery, filters);
-  plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification, negatedExcludeGenres);
+  // Entry 49 gap #4: "like X" reference-title detection. Skipped when the
+  // query already IS a strong title search on its own (classification.
+  // hasStrongTitleMatch) -- a plain "Vagabond" query shouldn't be routed
+  // through the "is there a REFERENCE to a title buried in this sentence"
+  // path at all, that's just a title search and already works.
+  const reference = classification.hasStrongTitleMatch
+    ? null
+    : await detectReferenceTitle(supabase, query || '');
+  const referenceResolution = await resolveReferenceTitle(reference, cleanQuery, filters);
+
+  let plan = referenceResolution.plan || buildBasicPlan(cleanQuery, filters);
+  if (!referenceResolution.plan) {
+    plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification, negatedExcludeGenres);
+  }
 
   // Exclusion-system pass: classification.negatedGenreTerms folded in
   // alongside the two existing exclusion sources (mood-word negation via
@@ -360,6 +420,13 @@ async function runManga({ query, filters, supabase }) {
       routing,
       classification,
       acclaim,
+      // Entry 49 gap #4 not wired into fan-out mode: Advanced Filter's
+      // request shape (filters-only, per Entries 12/16/25/26) doesn't
+      // carry the kind of free-text "like X" sentence this feature reads,
+      // so there's nothing to detect here. Kept in the response shape for
+      // consistency with the normal path below rather than omitting the
+      // key entirely.
+      referenceTitle: null,
     };
   }
 
@@ -367,6 +434,29 @@ async function runManga({ query, filters, supabase }) {
   const seenTitles = new Set();
   const contributingSources = [];
   let anySourceHadFullRawPage = false;
+
+  // Entry 49 gap #4. If referenceTitle.js confirmed a reference AND
+  // AniList had curated recommendations for it, those recommendations
+  // ARE the candidate pool -- seeded first so the waterfall below only
+  // tops up the remainder (and is skipped entirely once `limit` is hit,
+  // same "stop once we have enough" behavior the waterfall already has
+  // for its own sources). This is deliberately additive to the existing
+  // MANGA_SOURCES loop rather than a separate return path, so status/
+  // minScore/chapter filters, dedup-by-title, and hasMore all still work
+  // exactly as before for whatever isn't covered by recommendations.
+  if (referenceResolution.results && referenceResolution.results.length > 0) {
+    const filtered = applyPostFetchFilters(referenceResolution.results, filters) || [];
+    let contributed = false;
+    for (const item of filtered) {
+      if (accumulated.length >= limit) break;
+      const key = normalizeTitleKey(item);
+      if (key && seenTitles.has(key)) continue;
+      if (key) seenTitles.add(key);
+      accumulated.push(item);
+      contributed = true;
+    }
+    if (contributed) contributingSources.push('anilist-recommendations');
+  }
 
   for (const source of MANGA_SOURCES) {
     if (accumulated.length >= limit) break;
@@ -394,6 +484,23 @@ async function runManga({ query, filters, supabase }) {
       console.error(`[manga] ${source.name} failed`, err);
     }
   }
+
+  // Entry 49 gap #4 response metadata -- surfaced the same way mood/
+  // routing/classification already are, for aiPanel.js's reasoning trail
+  // and for debugging which of resolveReferenceTitle()'s three outcomes
+  // fired. `null` whenever no reference was detected (the overwhelming
+  // majority of queries), so this is additive-only for every existing
+  // caller that doesn't read the field.
+  const referenceTitle = reference
+    ? {
+        matchedPhrase: reference.matchedPhrase,
+        matchedTitle: reference.title,
+        matchScore: reference.score,
+        resolvedAniListId: referenceResolution.resolvedMedia?.id ?? null,
+        usedRecommendations: !!(referenceResolution.results && referenceResolution.results.length > 0),
+        usedGenreFallback: !!referenceResolution.plan,
+      }
+    : null;
 
   if (accumulated.length > 0) {
     let results = accumulated;
@@ -423,6 +530,7 @@ async function runManga({ query, filters, supabase }) {
       routing,
       classification,
       acclaim,
+      referenceTitle,
     };
   }
 
@@ -434,6 +542,7 @@ async function runManga({ query, filters, supabase }) {
     hasMore: false,
     routing,
     classification,
+    referenceTitle,
     acclaim,
   };
 }
