@@ -84,6 +84,16 @@ const MOOD_INTENSITY_SATURATION = 10;
 // existing genre/mood/title search results are unaffected by default.
 const MAX_QUALITY_WEIGHT = 0.4;
 
+// Entry 49 gap #3. Flat additive bonus (not part of the intent-budget
+// split like textMatch/genreMatch/emotionMatch/quality) applied on top of
+// finalScore when a candidate satisfies BOTH conjunctive clusters. Kept
+// as a separate additive term rather than folded into the existing
+// weight-budget math so it's a pure bonus for the rare double-match
+// candidate, not a redistribution that could shift ranking for every
+// other query. 0 for every query without a detected conjunction (the
+// default/common case) -- existing ranking behavior is unaffected.
+const CONJUNCTION_BONUS = 0.15;
+
 /**
  * Turns a rankCategories() result (e.g. [{category:'EMOTION',score:2},
  * {category:'GENRE',score:1}]) into normalized 0–1 weights per sub-score,
@@ -244,6 +254,23 @@ function descriptionMatchScore(candidate, moodMatchedTerms) {
 }
 
 /**
+ * Entry 49 gap #3. 1 if the candidate's own genres hit BOTH clusters from
+ * detectConjunctiveClusters() (mangaRouting.js), 0 otherwise -- including
+ * when it only hits one side, or when clusters is null (no conjunction
+ * detected for this query, the common case). Deliberately binary, not a
+ * partial/weighted score: the whole point is to separate "satisfies both
+ * required moods" from "satisfies only one", which a partial-credit scheme
+ * would blur back together.
+ */
+function conjunctionMatchScore(candidate, clusters) {
+  if (!clusters) return 0;
+  const candidateGenres = new Set((candidate.genres || []).map((g) => g.toLowerCase()));
+  const hitsA = clusters.clusterA.genres.some((g) => candidateGenres.has(g.toLowerCase()));
+  const hitsB = clusters.clusterB.genres.some((g) => candidateGenres.has(g.toLowerCase()));
+  return (hitsA && hitsB) ? 1 : 0;
+}
+
+/**
  * A sub-score is "saturated" across a batch if every candidate landed on
  * the exact same value — i.e. it contributes zero variance to the sort,
  * regardless of how much weight is nominally assigned to it. This is the
@@ -283,7 +310,7 @@ function computePopularityScores(results) {
  * acclaim intent gets the exact same ranking behavior as before this was
  * added.
  */
-function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, filterGenres, boostGenres, moodMatchedTerms, acclaimIntensity = 0 }) {
+function rankResults(results, { classifierRanked, moodAggregate, queryTokens, queryGenreTerms, filterGenres, boostGenres, moodMatchedTerms, acclaimIntensity = 0, conjunctiveClusters = null }) {
   const weights = computeRankingWeights(classifierRanked, moodAggregate, filterGenres);
   const popularityScores = computePopularityScores(results);
   const qualityScores = computeQualityScores(results);
@@ -339,13 +366,22 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
     // intentScore === baseIntentScore in that case, unchanged from before.
     const intentScore = remainingWeight * baseIntentScore + qualityWeight * quality;
 
-    const finalScore = INTENT_WEIGHT * intentScore + POPULARITY_WEIGHT * popularity;
+    // Entry 49 gap #3. Pure additive bonus, zero for the default/common
+    // case (conjunctiveClusters null -> conjunctionMatch always 0). Added
+    // after finalScore's normal weighted split rather than competing for a
+    // share of it, since this is meant to be a tiebreaker/lift for the
+    // rare double-match candidate, not a redistribution of everyone else's
+    // score.
+    const conjunctionMatch = conjunctionMatchScore(candidate, conjunctiveClusters);
+    const conjunctionBonus = conjunctiveClusters ? CONJUNCTION_BONUS * conjunctionMatch : 0;
+
+    const finalScore = INTENT_WEIGHT * intentScore + POPULARITY_WEIGHT * popularity + conjunctionBonus;
 
     return {
       ...candidate,
       _rankDebug: {
         textMatch, genreMatch, emotionMatch, descriptionMatch, popularity,
-        quality, qualityWeight, weights, saturated, finalScore
+        quality, qualityWeight, weights, saturated, conjunctionMatch, finalScore
       },
       finalScore
     };
