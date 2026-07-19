@@ -93,15 +93,54 @@ function buildMessages(query) {
       content:
         'You classify the emotional/mood intent of a manga search query ' +
         'into exactly ONE of these keys: ' + ROUTING_KEYS.join(', ') + '. ' +
-        'Reply with ONLY that single key, lowercase, no punctuation, ' +
-        'nothing else. Reply "none" if the query is just a genre name, a ' +
-        'title, an author, or otherwise has no real emotional/mood content ' +
-        'of its own. Examples: "I just want someone to stay" -> comfort. ' +
-        '"I need to feel something again" -> awe. "romance manga" -> none. ' +
-        '"vagabond" -> none. "something to make me feel less alone" -> comfort.'
+        'Reply "none" if the query is just a genre name, a title, an ' +
+        'author, or otherwise has no real emotional/mood content of its ' +
+        'own -- reply with just the word none, nothing else, in that case. ' +
+        'Otherwise reply in exactly this format: the single best-fit key, ' +
+        'lowercase, then a pipe character "|", then 2-4 short lowercase ' +
+        'keywords or short phrases (comma-separated) that capture what ' +
+        'this SPECIFIC query is about -- words and phrases that would ' +
+        'plausibly appear in a manga synopsis about this exact theme, not ' +
+        'generic emotion words. No other text, no explanation. ' +
+        'Examples: "I just want someone to stay" -> ' +
+        'comfort|staying, someone to rely on, not being abandoned. ' +
+        '"I want a story about finding people who become family" -> ' +
+        'comfort|found family, chosen family, belonging. ' +
+        '"I need a story that heals loneliness" -> ' +
+        'comfort|loneliness, connection, healing. ' +
+        '"romance manga" -> none. "vagabond" -> none.'
     },
     { role: 'user', content: query }
   ];
+}
+
+/**
+ * Parses a raw model reply into { key, keywords }. Format is
+ * "emotionkey|kw1, kw2, kw3" or the literal "none". Deliberately tolerant
+ * of a model that ignores the keyword half of the format and replies with
+ * just a bare key (older prompt behavior, or a model that drifts) --
+ * keywords degrades to an empty array in that case rather than failing the
+ * whole classification, since the emotion key alone is still useful even
+ * without keyword-level ranking signal.
+ */
+function parseClassification(rawContent) {
+  const trimmed = (rawContent || '').trim().toLowerCase();
+  if (!trimmed) return { key: null, keywords: [], valid: false };
+  if (trimmed.replace(/[^a-z]/g, '') === 'none') return { key: null, keywords: [], valid: true };
+
+  const pipeIndex = trimmed.indexOf('|');
+  const keyPart = (pipeIndex === -1 ? trimmed : trimmed.slice(0, pipeIndex)).replace(/[^a-z]/g, '');
+  if (!ROUTING_KEYS.includes(keyPart)) return { key: null, keywords: [], valid: false };
+
+  const keywords = pipeIndex === -1
+    ? []
+    : trimmed.slice(pipeIndex + 1)
+        .split(',')
+        .map((k) => k.replace(/[^a-z ]/g, '').trim())
+        .filter(Boolean)
+        .slice(0, 4);
+
+  return { key: keyPart, keywords, valid: true };
 }
 
 /**
@@ -128,7 +167,8 @@ async function callProvider({ url, model, apiKey, query, label }) {
       body: JSON.stringify({
         model,
         temperature: 0,
-        max_tokens: 10,
+        max_tokens: 40, // was 10 -- the reply now includes 2-4 keywords
+                        // alongside the emotion key, not just a bare key
         messages: buildMessages(query)
       })
     });
@@ -136,29 +176,24 @@ async function callProvider({ url, model, apiKey, query, label }) {
 
     if (!response.ok) {
       console.error(`[emotionalIntentFallback] ${label} returned HTTP ${response.status}`);
-      return { ok: false, key: null };
+      return { ok: false, key: null, keywords: [] };
     }
 
     const data = await response.json();
-    const raw = data?.choices?.[0]?.message?.content
-      ?.trim()
-      .toLowerCase()
-      .replace(/[^a-z]/g, '');
+    const { key, keywords, valid } = parseClassification(data?.choices?.[0]?.message?.content);
 
-    if (!raw) return { ok: false, key: null };
-    if (raw === 'none') return { ok: true, key: null };
-    if (!ROUTING_KEYS.includes(raw)) {
-      // Model replied with something that's neither a valid routing key
-      // nor "none" -- treat as a failure (not a confident "none") so the
-      // backup provider still gets a chance, same as a timeout would.
-      console.error(`[emotionalIntentFallback] ${label} returned unrecognized key: "${raw}"`);
-      return { ok: false, key: null };
+    if (!valid) {
+      // Neither a valid routing key nor a confident "none" -- treat as a
+      // failure (same as a timeout) so the backup provider still gets a
+      // chance, rather than silently accepting a malformed reply.
+      console.error(`[emotionalIntentFallback] ${label} returned unparseable reply: "${data?.choices?.[0]?.message?.content}"`);
+      return { ok: false, key: null, keywords: [] };
     }
-    return { ok: true, key: raw };
+    return { ok: true, key, keywords };
   } catch (err) {
     clearTimeout(timeout);
     console.error(`[emotionalIntentFallback] ${label} call failed`, err);
-    return { ok: false, key: null };
+    return { ok: false, key: null, keywords: [] };
   }
 }
 
@@ -173,14 +208,14 @@ async function classifyEmotionalIntent(query, groqApiKey, cerebrasApiKey) {
   const groqResult = await callProvider({
     url: GROQ_URL, model: GROQ_MODEL, apiKey: groqApiKey, query, label: 'groq'
   });
-  if (groqResult.ok) return { emotionKey: groqResult.key, provider: 'groq' };
+  if (groqResult.ok) return { emotionKey: groqResult.key, keywords: groqResult.keywords, provider: 'groq' };
 
   const cerebrasResult = await callProvider({
     url: CEREBRAS_URL, model: CEREBRAS_MODEL, apiKey: cerebrasApiKey, query, label: 'cerebras'
   });
-  if (cerebrasResult.ok) return { emotionKey: cerebrasResult.key, provider: 'cerebras' };
+  if (cerebrasResult.ok) return { emotionKey: cerebrasResult.key, keywords: cerebrasResult.keywords, provider: 'cerebras' };
 
-  return { emotionKey: null, provider: null };
+  return { emotionKey: null, keywords: [], provider: null };
 }
 
 /**
@@ -268,17 +303,42 @@ async function writeBackToLexicon(supabase, query, emotionKey, provider) {
 export async function getEmotionalIntentFallback(rawQuery, tokens, groqApiKey, cerebrasApiKey, supabase) {
   if (!hasMeaningfulContent(tokens)) return null;
 
-  const { emotionKey, provider } = await classifyEmotionalIntent(rawQuery, groqApiKey, cerebrasApiKey);
+  const { emotionKey, keywords, provider } = await classifyEmotionalIntent(rawQuery, groqApiKey, cerebrasApiKey);
   if (!emotionKey) return null;
 
   scheduleWriteBack(writeBackToLexicon(supabase, rawQuery, emotionKey, provider));
 
   const aggregate = { [emotionKey]: FALLBACK_INTENSITY };
-  const term = normalize(rawQuery).trim();
+
+  // FIX 2026-07-19 (Notion "Backend Update List" Entry 57): matchedTerms
+  // used to be a single entry holding the ENTIRE raw query string as
+  // "term" -- e.g. "i want a story about finding people who become
+  // family". rankResults.js's descriptionMatchScore() (built for the
+  // Mixer-saturation fix) checks whether each term literally appears as a
+  // substring in a candidate's synopsis -- a full sentence essentially
+  // never does, so descriptionMatch was silently always 0 for every query
+  // that reached this fallback. Once a query lands on a MANGA_ROUTING key
+  // (e.g. "comfort"), every such query became indistinguishable: same
+  // boosted genres -> same genre_in browse -> saturated genre/emotion
+  // scores -> descriptionMatch fallback fires but finds nothing -> ranking
+  // silently degrades to popularity, so distinct queries like "heals
+  // loneliness" vs. "found family" vs. "nobody left behind" all returned
+  // the same handful of popular Drama/Slice of Life titles reshuffled.
+  // Using the LLM's own short, synopsis-plausible keywords (see
+  // buildMessages()'s updated prompt) instead of the raw sentence gives
+  // descriptionMatchScore() real per-candidate signal to work with, so a
+  // candidate whose synopsis actually mentions "found family" or
+  // "loneliness" now ranks above one that merely shares a genre tag.
+  // Falls back to the old single-full-sentence term if the model replied
+  // with just a bare key and no keywords (e.g. an older/drifted reply) --
+  // strictly no worse than before in that case, not a regression.
+  const matchedTerms = keywords.length > 0
+    ? keywords.map((term) => ({ term, emotions: aggregate, source: `emotional_intent_fallback:${provider}` }))
+    : [{ term: normalize(rawQuery).trim(), emotions: aggregate, source: `emotional_intent_fallback:${provider}` }];
 
   return {
     aggregate,
     negatedAggregate: {},
-    matchedTerms: [{ term, emotions: aggregate, source: `emotional_intent_fallback:${provider}` }],
+    matchedTerms,
   };
 }
