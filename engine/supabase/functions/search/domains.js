@@ -237,7 +237,7 @@ function applyMoodBoost(results, boostGenres) {
 }
 
 async function computeQueryClassification(supabase, rawQuery) {
-  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
+  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [], genreOnlyTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
   try {
     const scores = await classifyQuery(supabase, rawQuery);
     const ranked = rankCategories(scores);
@@ -245,6 +245,21 @@ async function computeQueryClassification(supabase, rawQuery) {
       ...(scores.GENRE ? scores.GENRE.matches : []),
       ...(scores.TAG ? scores.TAG.matches : [])
     ];
+    // FIX 2026-07-19 (Notion "Backend Update List" Entry 53): genreTerms
+    // above is ranking-only (queryGenreTerms, read by rankResults() below)
+    // and was never merged into plan.primaryGenres for ANY category --
+    // so a literal, unambiguous genre word typed in free text ("Sports
+    // manga that will make me cry") got scored and then discarded before
+    // the fetch ever ran, and the actual candidate pool came entirely from
+    // mood-boosted genres instead. genreOnlyTerms is a second, stricter
+    // list -- GENRE-category matches only, no TAG -- since TAG's 420-row
+    // vocab is the same noisy, false-positive-prone word-bag matching
+    // Entry 33 already flagged for TITLE; only a real GENRE hit is trusted
+    // enough to actually constrain the fetch (see runManga() below for
+    // where this gets folded into plan.primaryGenres). genreTerms itself
+    // is untouched -- still ranking-only, still includes TAG, so
+    // rankResults()'s existing scoring behavior doesn't change.
+    const genreOnlyTerms = scores.GENRE ? scores.GENRE.matches : [];
     // Exclusion-system pass. "anything except horror" -> GENRE.negatedMatches
     // = ['Horror'] -> this -> merged into plan.excludedGenres below, same
     // hard-filter mechanism (genre_not_in on AniList, ID-exclusion on
@@ -253,10 +268,10 @@ async function computeQueryClassification(supabase, rawQuery) {
     // GENRE/TAG are negatable here, not TITLE/AUTHOR/CHARACTER.
     const negatedGenreTerms = getNegatedGenreTerms(scores);
     const strongTitleMatch = hasStrongTitleMatch(scores, rawQuery);
-    return { ranked, genreTerms, negatedGenreTerms, hasStrongTitleMatch: strongTitleMatch };
+    return { ranked, genreTerms, genreOnlyTerms, negatedGenreTerms, hasStrongTitleMatch: strongTitleMatch };
   } catch (err) {
     console.error('[domains] query classification failed', err);
-    return { ranked: [], genreTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
+    return { ranked: [], genreTerms: [], genreOnlyTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
   }
 }
 
@@ -357,6 +372,31 @@ async function runManga({ query, filters, supabase }) {
   let plan = referenceResolution.plan || buildBasicPlan(cleanQuery, filters);
   if (!referenceResolution.plan) {
     plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification, negatedExcludeGenres);
+  }
+
+  // FIX 2026-07-19 (Notion "Backend Update List" Entry 53): a literal genre
+  // word typed in free text ("Sports manga that will make me cry") was
+  // detected by the classifier but never reached the fetch step at all --
+  // only filters.genres (explicit panel selection) and mood-routing's
+  // topGenres (Entry 32) ever populated primaryGenres. Skipped when there's
+  // already an explicit genre-filter selection (that takes precedence),
+  // when a "like X" reference title was resolved (different candidate-pool
+  // strategy entirely, genre words in the modifier clause stay ranking-
+  // only same as before), or when the query is itself a strong title
+  // search. Merged with (not replacing) whatever mood-derived genres
+  // already ended up in plan.primaryGenres above. genreOnlyTerms is
+  // already correctly-cased for AniList (harvested directly from AniList's
+  // own genre vocabulary via lexicon_entities), so no Entry-52-style case
+  // translation is needed here -- toAniListGenre() in anilist.js passes
+  // already-correct names straight through unchanged either way.
+  const hasExplicitGenreFilter = Array.isArray(filters?.genres) && filters.genres.length > 0;
+  if (
+    !hasExplicitGenreFilter &&
+    !referenceResolution.plan &&
+    !classification.hasStrongTitleMatch &&
+    classification.genreOnlyTerms.length > 0
+  ) {
+    plan.primaryGenres = [...new Set([...(plan.primaryGenres || []), ...classification.genreOnlyTerms])];
   }
 
   // Exclusion-system pass: classification.negatedGenreTerms folded in
