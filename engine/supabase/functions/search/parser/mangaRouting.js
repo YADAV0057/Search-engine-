@@ -15,7 +15,24 @@ export const MANGA_ROUTING = {
   dread:         { boost: ['horror', 'psychological', 'thriller'], exclude: ['comedy', 'sliceoflife'] },
   fear:          { boost: ['horror', 'thriller'],             exclude: ['comedy', 'sliceoflife'] },
   disgust:       { boost: ['horror'],                         exclude: ['comedy', 'romance'] },
-  sadness:       { boost: ['drama', 'psychological'],         exclude: ['comedy'] },
+  // FIX 2026-07-19 (Notion "Backend Update List" Entry 49, gap #2):
+  // 'sadness' used to boost 'psychological' alongside 'drama'. That genre
+  // is exactly what dark/horror-adjacent titles (Monster, Berserk, Uzumaki)
+  // carry, so a plain "I want to cry" query pulled them in with nothing to
+  // filter them back out -- 'excludeGenres' was empty for this key, and
+  // 'psychological' isn't excluded elsewhere in the pipeline for a sadness
+  // signal. Root cause: sadness (tearjerker/loss) and dark/disturbing
+  // content share this one genre bucket at the genre-classification level
+  // this catalog uses -- there's no finer-grained tag system (checked
+  // VALID_ROUTING_GENRES/adapters directly; only these 14 genres exist,
+  // no tag-level boost/exclude). Fix: stop boosting 'psychological' for
+  // sadness, explicitly exclude 'horror'/'psychological' so tearjerker
+  // queries can't surface dark content, and add 'romance'/'sliceoflife'
+  // to boost since that's where actual tearjerkers (Your Lie in April,
+  // A Silent Voice) live in this genre taxonomy. Genuinely dark/traumatic
+  // queries are unaffected -- they route through 'trauma'/'dread' below,
+  // which still boost 'psychological' on purpose.
+  sadness:       { boost: ['drama', 'romance', 'sliceoflife'], exclude: ['comedy', 'horror', 'psychological'] },
   melancholy:    { boost: ['drama', 'sliceoflife'],           exclude: ['comedy'] },
   trauma:        { boost: ['psychological', 'drama'],         exclude: ['comedy'] },
   awe:           { boost: ['fantasy', 'scifi', 'adventure'],  exclude: [] },
