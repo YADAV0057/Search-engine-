@@ -45,7 +45,11 @@ let cache = null;
 let cacheLoadedAt = 0;
 let warmingPromise = null;
 
-function significantTokens(name) {
+// Exported (was module-private) so referenceTitle.js's phrase-vs-title
+// overlap scoring tokenizes identically to how these TITLE entries were
+// tokenized when the vocab cache was built -- same reasoning as reusing
+// getTitleVocabEntries() below instead of re-querying lexicon_entities.
+export function significantTokens(name) {
   return normalizeAndTokenize(name).filter((t) => t.length >= MIN_SIGNIFICANT_WORD_LENGTH);
 }
 
@@ -202,6 +206,17 @@ export async function classifyQuery(supabase, rawQuery) {
   }
 
   return scores;
+}
+
+// New for referenceTitle.js (Entry 49 gap #4). Reuses whatever's already
+// in the module-level `cache` (warmed by classifyQuery() above, 6h TTL,
+// same 9,912-row TITLE list) instead of a second lexicon_entities load --
+// domains.js already calls classifyQuery() once per request before this
+// would ever run, so in practice this just returns the already-warm Map
+// entry with no extra DB round trip.
+export async function getTitleVocabEntries(supabase) {
+  const vocabByCategory = await warmCache(supabase);
+  return vocabByCategory.get('TITLE') || [];
 }
 
 export function rankCategories(scores) {
