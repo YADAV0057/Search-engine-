@@ -57,11 +57,21 @@ params.set('include', 'categories');
         params.set('filter[text]', freeText);
     }
 
-    // NOTE: Kitsu's JSON:API filtering doesn't support a clean "exclude
-    // category" filter the way AniList/Jikan do, so plan.excludedGenres is
-    // intentionally not applied here — Kitsu results may include an
-    // excluded genre. This mirrors a real limitation of the Kitsu API,
-    // not an oversight.
+    // FIX 2026-07-19 (Notion "Backend Update List" Entry 50's own follow-up
+    // note: "kitsu.js lacks an equivalent category-filter mechanism --
+    // exclusion there is weaker, worth checking during testing"). The old
+    // comment here said Kitsu's JSON:API can't filter by "not category" --
+    // true for the SERVER-SIDE request, but irrelevant: this function
+    // already fetches `include=categories` and resolves each result's own
+    // genre names into `genres` below (categoryTitleById), purely to
+    // populate the response. That same data means exclusion CAN be applied
+    // client-side, post-fetch, before returning -- see the filter after the
+    // .map() below. Same canonical-key normalization as jikan.js's
+    // toGenreKey() (lowercase, strip non-letters) so 'Slice of Life' /
+    // 'sliceoflife' / any Entry-52-style routing key all compare equal
+    // regardless of which upstream source produced plan.excludedGenres.
+    const toGenreKey = (s) => (s || '').toLowerCase().replace(/[^a-z]/g, '');
+    const excludedKeys = new Set((plan.excludedGenres || []).map(toGenreKey));
 
     if (plan.filters?.statusFilter && STATUS_TO_KITSU[plan.filters.statusFilter]) {
         params.set('filter[status]', STATUS_TO_KITSU[plan.filters.statusFilter]);
@@ -116,6 +126,22 @@ return data.data.map(m => {
                 chapters: attr.chapterCount || null,
                 status: KITSU_STATUS_MAP[attr.status] || attr.status
             };
+        }).filter(item => {
+            // Entry 50 follow-up fix: hard-exclude anything carrying an
+            // excluded genre, same semantics as AniList's genre_not_in and
+            // Jikan's ID-exclusion -- a real filter, not a ranking nudge.
+            // Caveat (not fixed here, flagging for a future session): this
+            // filters AFTER Kitsu has already paginated server-side, so a
+            // page that would otherwise be full can come back short if
+            // several items in that page happen to carry an excluded
+            // genre -- same class of "fewer results than requested" issue
+            // already flagged elsewhere in this doc (Entry 29's New
+            // Releases note). Kitsu is 3rd in the waterfall and only
+            // reached when AniList+Jikan are both empty, so the practical
+            // impact is narrow, but a real fix would need to over-fetch
+            // and re-paginate rather than filter the already-paginated page.
+            if (excludedKeys.size === 0) return true;
+            return !item.genres.some(g => excludedKeys.has(toGenreKey(g)));
         });
     } catch (error) {
         clearTimeout(timeout);
