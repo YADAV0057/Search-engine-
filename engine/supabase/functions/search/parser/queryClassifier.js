@@ -258,6 +258,21 @@ export async function getTagVocabEntries(supabase) {
   return vocabByCategory.get('TAG') || [];
 }
 
+// Added for parser/tropeSignature.js (Notion "Backend Update List" Entry
+// 71). Same reasoning and same warm module-level cache as
+// getTitleVocabEntries()/getTagVocabEntries() immediately above --
+// CATEGORY_ENTITY_TYPES.GENRE maps to entity_type='genre' rows in
+// lexicon_entities (the real, harvested AniList genre vocabulary -- 19
+// rows as of Entry 37/41's checks, a broader/more current list than
+// mangaRouting.js's fixed 14-entry VALID_ROUTING_GENRES, which is a
+// routing-table constant, not a vocabulary). tropeSignature.js needs real
+// genre NAMES to constrain its LLM prompt to, the same way it already
+// needs getTagVocabEntries()'s real tag names -- this is that second half.
+export async function getGenreVocabEntries(supabase) {
+  const vocabByCategory = await warmCache(supabase);
+  return vocabByCategory.get('GENRE') || [];
+}
+
 export function rankCategories(scores) {
   return Object.entries(scores)
     .map(([category, { score }]) => ({ category, score }))
