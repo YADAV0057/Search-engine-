@@ -302,3 +302,70 @@ export async function fetchAniListRecommendations(mediaId, limit = 10) {
         return [];
     }
 }
+
+// ==========================================
+// Entry 59 fix (Notion "Backend Update List"): fetches a candidate pool by
+// real, curated AniList tags (tag_in) -- the missing piece behind "every
+// comfort query returns the same ~10 titles". Entry 57/58 already fixed
+// the mood pipeline to generate genuine per-query keywords and made
+// rankResults.js's descriptionMatchScore() able to use them, but neither
+// fix touched the FETCH stage: the candidate pool itself was still only
+// ever built from genre_in (mangaRouting.js's coarse ~14-genre table), so
+// every "comfort" query browsed the identical POPULARITY_DESC set no
+// matter which specific comfort keywords it matched, and re-ranking a
+// fixed pool can't surface a title that was never fetched. This function
+// (paired with queryClassifier.js's getTagVocabEntries() and domains.js's
+// resolveMoodTagCandidates()) is what actually diversifies the pool per
+// query, by browsing AniList's own ~400+ curated tags (e.g. "Found
+// Family", "Time Skip") instead of just its 19 broad genres -- same
+// Page/media shape as fetchFromAniListUnified() above, but keyed on
+// tag_in like resolveReferenceTitle()'s recommendations call above is
+// keyed on a resolved media id.
+// ==========================================
+
+/**
+ * tags must already be REAL AniList tag names (matched against
+ * lexicon_entities entity_type='tag' by domains.js's
+ * resolveMoodTagCandidates() -- never raw, unverified LLM keyword
+ * phrasing passed straight through) -- tag_in is a strict enum-ish match
+ * against AniList's own tag vocabulary, so an unmatched/made-up tag name
+ * would just silently return zero results rather than erroring.
+ */
+export async function fetchAniListMediaByTags(tags, limit = 15) {
+    if (!tags || tags.length === 0) return [];
+
+    const query = `
+        query ($tags: [String], $perPage: Int) {
+            Page(page: 1, perPage: $perPage) {
+                media(tag_in: $tags, type: MANGA, isAdult: false, sort: [POPULARITY_DESC]) {
+                    ${MEDIA_FIELDS}
+                }
+            }
+        }
+    `;
+
+    try {
+        const response = await fetch('https://graphql.anilist.co', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+            body: JSON.stringify({ query, variables: { tags, perPage: limit } })
+        });
+
+        if (!response.ok) {
+            console.error(`AniList API returned HTTP ${response.status} (tag browse)`);
+            return [];
+        }
+
+        const data = await response.json();
+        if (data.errors) {
+            console.error("AniList GraphQL Error (tag browse):", data.errors);
+            return [];
+        }
+
+        const media = data.data ? data.data.Page.media : [];
+        return media.map((m) => ({ ...m, releaseDate: buildReleaseDate(m.startDate) }));
+    } catch (error) {
+        console.error("AniList API Error (tag browse):", error);
+        return [];
+    }
+}
