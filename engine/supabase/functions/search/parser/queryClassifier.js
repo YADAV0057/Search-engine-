@@ -159,16 +159,39 @@ function matchesCategoryPhrase(queryTokens, negated, vocabEntries) {
   return { matches, negatedMatches };
 }
 
-function scoreEmotion(queryTokens) {
+function scoreEmotion(queryTokens, lexiconMatchedTerms = []) {
   const matches = [];
   for (const token of queryTokens) {
     const score = getAfinnScore(token);
     if (score !== null && score !== 0) matches.push(token);
   }
+  // FIX 2026-07-19 (Notion "Backend Update List" Entry 65): also count real
+  // phrase-level custom-lexicon mood matches (idiom/trope terms like
+  // "enemies to lovers", already computed by moodLexicon.js's
+  // analyzeQueryMood() one step earlier in domains.js's runManga()) as
+  // EMOTION signal. Previously this function only ever looked at raw
+  // single-token AFINN scores, so a query whose entire real mood signal
+  // came from a multi-word lexicon phrase match (not a single AFINN-scored
+  // word) had its EMOTION category weight in computeRankingWeights()
+  // determined by whichever unrelated individual word in the query
+  // happened to also carry its own AFINN score — e.g. "enemies" alone
+  // scores -2 in AFINN (generic negative sentiment), completely
+  // disconnected from the {romance:7, tension:4} the phrase "enemies to
+  // lovers" actually carries in manga_emotion_lexicon. That mismatched,
+  // arbitrary weight is what let unrelated tension/horror-genre candidates
+  // (e.g. Bastard) compete on equal footing with genuine romance-trope
+  // matches for their share of the ranking-weight budget. lexiconMatchedTerms
+  // is optional and defaults to [] — callers that don't pass it (none
+  // currently, but keeping this safe) get byte-identical old behavior.
+  for (const m of lexiconMatchedTerms) {
+    if (m && m.source === 'custom_lexicon' && m.term && !matches.includes(m.term)) {
+      matches.push(m.term);
+    }
+  }
   return matches;
 }
 
-export async function classifyQuery(supabase, rawQuery) {
+export async function classifyQuery(supabase, rawQuery, lexiconMatchedTerms = []) {
   const queryTokens = normalizeAndTokenize(rawQuery || '');
   if (queryTokens.length === 0) return {};
 
@@ -200,7 +223,7 @@ export async function classifyQuery(supabase, rawQuery) {
     }
   }
 
-  const emotionMatches = scoreEmotion(queryTokens);
+  const emotionMatches = scoreEmotion(queryTokens, lexiconMatchedTerms);
   if (emotionMatches.length > 0) {
     scores.EMOTION = { score: emotionMatches.length, matches: emotionMatches };
   }
