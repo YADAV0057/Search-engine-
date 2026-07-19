@@ -51,6 +51,72 @@ export const MANGA_ROUTING = {
   negative:      { boost: ['drama', 'psychological'],         exclude: [] }
 };
 
+// FIX 2026-07-19 (Notion "Backend Update List" Entry 49, gap #3):
+// "dark but wholesome" only returned dark titles (Berserk, Tokyo Ghoul).
+// Root cause: getRoutingForMood() above merges every active emotion into
+// ONE additive weighted boost list. When two emotions are both present --
+// e.g. dread (boosts horror/psychological) and comfort (boosts
+// sliceoflife/drama, EXCLUDES horror) -- their signals get blended into a
+// single list rather than treated as two things that both need to be
+// true. A candidate only has to score well on ONE side to rank top, so a
+// popular pure-horror title beats a rare dark-AND-wholesome one every
+// time, even though the merged boost list nominally includes both sides'
+// genres.
+//
+// Fix: detect when two active emotions in the aggregate are in genuine
+// conflict -- one's `boost` list overlaps the other's `exclude` list (or
+// vice versa) -- since that's a reliable signal the person means two
+// distinct, simultaneously-required moods ("X but Y"), not one blended
+// mood that happens to touch two genres. When found, return the two
+// genre clusters separately so rankResults.js can reward candidates that
+// hit BOTH clusters, instead of just summing weight across a merged list.
+//
+// Deliberately conservative: only fires on a genuine boost/exclude
+// conflict between two SUFFICIENTLY WEIGHTED emotions (reuses the same
+// order-of-magnitude threshold as domains.js's
+// MOOD_GENRE_INCLUSION_THRESHOLD, duplicated here rather than imported to
+// keep this module dependency-free of domains.js). An ordinary single-
+// mood query (just "sadness", or "dread" alone) never has two emotions to
+// compare, so this returns null and rankResults.js's new conjunction
+// bonus contributes nothing -- existing single-mood ranking behavior is
+// completely unaffected.
+//
+// Only checks pairs, not full N-way combinations -- "X but Y but Z"
+// three-clause conjunctions aren't handled by this pass; scoped to the
+// concrete two-clause case QA actually found ("dark but wholesome").
+// Worth revisiting if a real three-clause query shows up in testing.
+const CONJUNCTIVE_WEIGHT_THRESHOLD = 2;
+
+export function detectConjunctiveClusters(aggregate) {
+  if (!aggregate) return null;
+
+  const activeEmotions = Object.entries(aggregate)
+    .filter(([emotion, weight]) => weight >= CONJUNCTIVE_WEIGHT_THRESHOLD && MANGA_ROUTING[emotion.toLowerCase()]);
+
+  if (activeEmotions.length < 2) return null;
+
+  for (let i = 0; i < activeEmotions.length; i++) {
+    for (let j = i + 1; j < activeEmotions.length; j++) {
+      const [emotionA, weightA] = activeEmotions[i];
+      const [emotionB, weightB] = activeEmotions[j];
+      const routingA = MANGA_ROUTING[emotionA.toLowerCase()];
+      const routingB = MANGA_ROUTING[emotionB.toLowerCase()];
+
+      const aBoostsWhatBExcludes = routingA.boost.some((g) => routingB.exclude.includes(g));
+      const bBoostsWhatAExcludes = routingB.boost.some((g) => routingA.exclude.includes(g));
+
+      if (aBoostsWhatBExcludes || bBoostsWhatAExcludes) {
+        return {
+          clusterA: { emotion: emotionA, genres: routingA.boost, weight: weightA },
+          clusterB: { emotion: emotionB, genres: routingB.boost, weight: weightB },
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
 export function getRoutingForMood(aggregate) {
   if (!aggregate || Object.keys(aggregate).length === 0) {
     return { boostGenres: [], excludeGenres: [] };
