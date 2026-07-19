@@ -219,6 +219,22 @@ export async function getTitleVocabEntries(supabase) {
   return vocabByCategory.get('TITLE') || [];
 }
 
+// Entry 59 fix. Mirrors getTitleVocabEntries() immediately above -- same
+// reasoning, same warm module-level cache (already loads entity_type=
+// 'tag'/'theme'/'demographic' rows into the TAG bucket per
+// CATEGORY_ENTITY_TYPES, ~420 real curated AniList tags as of this fix)
+// instead of a second lexicon_entities round trip. Used by domains.js's
+// resolveMoodTagCandidates() to match the mood pipeline's LLM-generated
+// keywords (emotionalIntentFallback.js's `keywords` / moodLexicon.js's
+// matchedTerms) against real AniList tag names before ever calling
+// AniList's tag_in browse -- see anilist.js's fetchAniListMediaByTags()
+// header for why matching against the real vocab (not passing raw LLM
+// phrasing straight through) matters.
+export async function getTagVocabEntries(supabase) {
+  const vocabByCategory = await warmCache(supabase);
+  return vocabByCategory.get('TAG') || [];
+}
+
 export function rankCategories(scores) {
   return Object.entries(scores)
     .map(([category, { score }]) => ({ category, score }))
