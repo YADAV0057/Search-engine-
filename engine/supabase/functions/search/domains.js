@@ -7,7 +7,7 @@ import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
 import { getRoutingForMood } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
-import { classifyQuery, rankCategories, hasStrongTitleMatch } from './parser/queryClassifier.js';
+import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms } from './parser/queryClassifier.js';
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
 
 const DEFAULT_PAGE = 1;
@@ -222,7 +222,7 @@ function applyMoodBoost(results, boostGenres) {
 }
 
 async function computeQueryClassification(supabase, rawQuery) {
-  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [], hasStrongTitleMatch: false };
+  if (!supabase || !rawQuery) return { ranked: [], genreTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
   try {
     const scores = await classifyQuery(supabase, rawQuery);
     const ranked = rankCategories(scores);
@@ -230,11 +230,18 @@ async function computeQueryClassification(supabase, rawQuery) {
       ...(scores.GENRE ? scores.GENRE.matches : []),
       ...(scores.TAG ? scores.TAG.matches : [])
     ];
+    // Exclusion-system pass. "anything except horror" -> GENRE.negatedMatches
+    // = ['Horror'] -> this -> merged into plan.excludedGenres below, same
+    // hard-filter mechanism (genre_not_in on AniList, ID-exclusion on
+    // Jikan/MangaDex) that filters.excludedGenres and mood-negation already
+    // use. See queryClassifier.js's getNegatedGenreTerms() for why only
+    // GENRE/TAG are negatable here, not TITLE/AUTHOR/CHARACTER.
+    const negatedGenreTerms = getNegatedGenreTerms(scores);
     const strongTitleMatch = hasStrongTitleMatch(scores, rawQuery);
-    return { ranked, genreTerms, hasStrongTitleMatch: strongTitleMatch };
+    return { ranked, genreTerms, negatedGenreTerms, hasStrongTitleMatch: strongTitleMatch };
   } catch (err) {
     console.error('[domains] query classification failed', err);
-    return { ranked: [], genreTerms: [], hasStrongTitleMatch: false };
+    return { ranked: [], genreTerms: [], negatedGenreTerms: [], hasStrongTitleMatch: false };
   }
 }
 
@@ -267,11 +274,19 @@ async function runManga({ query, filters, supabase }) {
   let plan = buildBasicPlan(cleanQuery, filters);
   plan = applyMoodGenreRouting(plan, cleanQuery, filters, routing, classification, negatedExcludeGenres);
 
-  if (routing.excludeGenres.length > 0 || negatedExcludeGenres.length > 0) {
+  // Exclusion-system pass: classification.negatedGenreTerms folded in
+  // alongside the two existing exclusion sources (mood-word negation via
+  // Entry 39, and filter-panel excludedGenres via buildBasicPlan's default
+  // branch / buildPlanFromGenreList). This is what makes "anything except
+  // horror" actually exclude Horror at the fetch level -- see
+  // computeQueryClassification() above and queryClassifier.js's
+  // getNegatedGenreTerms().
+  if (routing.excludeGenres.length > 0 || negatedExcludeGenres.length > 0 || classification.negatedGenreTerms.length > 0) {
     plan.excludedGenres = [...new Set([
       ...(plan.excludedGenres || []),
       ...routing.excludeGenres,
       ...negatedExcludeGenres,
+      ...classification.negatedGenreTerms,
     ])];
   }
 
