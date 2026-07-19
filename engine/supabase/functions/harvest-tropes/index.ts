@@ -1,7 +1,7 @@
 // ==========================================
 // TROPE HARVESTER — Edge Function entry point
 // supabase/functions/harvest-tropes/index.ts
-// ==========================================
+// ========================================== 
 // POST /harvest-tropes   (header: x-harvest-secret: <HARVEST_SECRET>)
 // { "mode": "bootstrap" }   (optional, default: bootstrap)
 // -> { "results": { "bootstrap": { checked, seeded, skippedExisting, skippedLowConfidence }, "searchCacheScan": {...} } }
