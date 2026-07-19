@@ -329,10 +329,30 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
 
   const genreSaturated = isSaturated(partial.map((p) => p.genreMatch));
   const emotionSaturated = isSaturated(partial.map((p) => p.emotionMatch));
-  // Only fall back when BOTH discriminating signals are degenerate — if
-  // either one still varies across the batch, ranking already has a real
-  // signal to work with and descriptionMatch would just add noise.
-  const saturated = genreSaturated && emotionSaturated && (weights.genreMatch + weights.emotionMatch) > 0;
+  // FIX 2026-07-19 (Notion "Backend Update List" Entry 63/64): previously
+  // only redirected wasted weight when BOTH genreMatch and emotionMatch
+  // were saturated together (the Mixer hard-filter case, where both
+  // saturate to a constant 1.0). That missed a distinct, more common case:
+  // a TAG-classified query term (e.g. "magic") that never literally
+  // appears in any candidate.genres list, so genreMatchScore() saturates
+  // to a constant 0 for every candidate — while emotionMatch (a totally
+  // separate code path, scored against mood-derived boost genres) still
+  // varies normally. The old dual-condition check read that as "real
+  // signal already exists, don't touch it" and left genreMatch's own
+  // weight share permanently wasted (multiplied against a value that's
+  // always 0), quietly shrinking the effective intent budget instead of
+  // fully using it — this is why a correctly-higher-emotionMatch candidate
+  // (e.g. Solo Leveling for "magic that feels mysterious") still lost to
+  // a more popular but less atmospheric one (Berserk): its real emotionMatch
+  // edge was diluted by wasted genreMatch weight sitting in the same budget.
+  // Now each term's saturation is handled independently below — whichever
+  // of genreMatch/emotionMatch is flat has ONLY its own weight share
+  // redirected to descriptionMatch; a term that still varies keeps
+  // contributing its own real per-candidate signal unchanged. When both
+  // happen to be saturated together, the net effect is identical to the
+  // old behavior (both redirected) — this is a strict generalization, not
+  // a behavior change for the case the original Mixer fix was built for.
+  const saturated = (genreSaturated && weights.genreMatch > 0) || (emotionSaturated && weights.emotionMatch > 0);
 
   // Entry 35/40. How much of the intent budget quality claims this batch —
   // zero for an ordinary query, up to MAX_QUALITY_WEIGHT for a query that
@@ -346,13 +366,21 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
     let descriptionMatch = 0;
 
     if (saturated) {
-      // genreMatch/emotionMatch are identical for every candidate here, so
-      // whatever weight computeRankingWeights() assigned them is
-      // contributing zero information to the sort. Redirect that combined
-      // weight to descriptionMatch instead of just discarding it.
+      // FIX Entry 63/64: redirect only the weight of whichever term(s)
+      // are actually saturated for THIS batch — a term still varying
+      // keeps its own real per-candidate score instead of being folded
+      // into the flat descriptionMatch redirect too.
       descriptionMatch = descriptionMatchScore(candidate, moodMatchedTerms);
-      const borrowedWeight = weights.genreMatch + weights.emotionMatch;
-      baseIntentScore = weights.textMatch * textMatch + borrowedWeight * descriptionMatch;
+      const redirectedWeight =
+        (genreSaturated ? weights.genreMatch : 0) +
+        (emotionSaturated ? weights.emotionMatch : 0);
+      const keptGenreMatch = genreSaturated ? 0 : weights.genreMatch * genreMatch;
+      const keptEmotionMatch = emotionSaturated ? 0 : weights.emotionMatch * emotionMatch;
+      baseIntentScore =
+        weights.textMatch * textMatch +
+        keptGenreMatch +
+        keptEmotionMatch +
+        redirectedWeight * descriptionMatch;
     } else {
       baseIntentScore =
         weights.textMatch * textMatch +
