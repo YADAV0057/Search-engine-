@@ -1,6 +1,7 @@
 import { getAfinnScore } from './dictionary/afinn.js';
 import { getEmotionWordOverride } from './emotionWords.js';
 import { STOPWORDS } from './normalize.js';
+import { computeNegationMask } from './negation.js';
 
 const MAX_PHRASE_WORDS = 4;
 
@@ -17,40 +18,14 @@ const MAX_PHRASE_WORDS = 4;
 // trying to invert emotion-word-map categories (inversion is semantically
 // murkier -- "not happy" isn't cleanly "sad").
 //
-// NEGATION_SCOPE_TOKENS is a raw token-count window (not a content-word
-// count) so it can reach past short filler/stopwords sitting between the
-// trigger and the actual emotion word -- e.g. "don't want anything sad"
-// needs to reach 3 tokens past "don't" to suppress "sad". Not yet tuned
-// against a broad query sample; same caveat as MOOD_GENRE_INCLUSION_THRESHOLD
-// and TITLE_SIMILARITY_THRESHOLD elsewhere in this pass.
-const NEGATION_SCOPE_TOKENS = 3;
-
-const NEGATION_TRIGGERS = new Set([
-  'not', 'no', 'never', 'without',
-  "don't", "doesn't", "didn't", "isn't", "aren't", "wasn't", "weren't",
-  "won't", "wouldn't", "couldn't", "shouldn't", "can't", 'cannot',
-  "haven't", "hasn't", "hadn't"
-]);
-
-function isNegationTrigger(token) {
-  return NEGATION_TRIGGERS.has(token) || token.endsWith("n't");
-}
-
-// Marks, for each token index, whether it falls within NEGATION_SCOPE_TOKENS
-// tokens after a negation trigger. The trigger word itself is never marked
-// (its own AFINN score, if any -- e.g. "no" is -1 in AFINN -- is left as
-// pre-existing behavior, not part of this fix).
-function computeNegationMask(tokens) {
-  const negated = new Array(tokens.length).fill(false);
-  for (let i = 0; i < tokens.length; i++) {
-    if (!isNegationTrigger(tokens[i])) continue;
-    for (let j = i + 1; j <= i + NEGATION_SCOPE_TOKENS && j < tokens.length; j++) {
-      negated[j] = true;
-    }
-  }
-  return negated;
-}
-
+// UPDATED (exclusion-system pass): the trigger list and windowing logic
+// moved out to parser/negation.js so queryClassifier.js could reuse the
+// exact same negation detection for GENRE/TAG terms, not just emotion words
+// -- see that file's header for why (short version: "anything except
+// horror" was being scored as a POSITIVE genre match before that split,
+// because queryClassifier.js had no negation awareness of its own). Nothing
+// about this file's own behavior changes; computeNegationMask() is called
+// exactly as before, just imported instead of defined locally.
 function scoreToTone(score) {
   if (score > 0) return 'positive';
   if (score < 0) return 'negative';
