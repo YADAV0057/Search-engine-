@@ -5,7 +5,7 @@ import { fetchFromJikanFallback } from './adapters/jikan.js';
 import { fetchFromKitsuFallback } from './adapters/kitsu.js';
 import { fetchFromMangaDexFallback } from './adapters/mangadex.js';
 import { analyzeQueryMood } from './parser/moodLexicon.js';
-import { getRoutingForMood } from './parser/mangaRouting.js';
+import { getRoutingForMood, detectConjunctiveClusters } from './parser/mangaRouting.js';
 import { rankResults } from './parser/rankResults.js';
 import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms } from './parser/queryClassifier.js';
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
@@ -261,6 +261,12 @@ async function runManga({ query, filters, supabase }) {
   // opposite.
   const negatedRouting = mood ? getRoutingForMood(mood.negatedAggregate) : { boostGenres: [], excludeGenres: [] };
   const negatedExcludeGenres = (negatedRouting.boostGenres || []).map((g) => g.genre);
+  // Entry 49 gap #3. Computed once, reused in both the fan-out and normal
+  // rankResults() call sites below -- same pattern as routing/acclaim
+  // above. null for the overwhelming majority of queries (no conjunction
+  // detected), in which case rankResults.js's conjunction bonus is 0 and
+  // ranking is completely unaffected.
+  const conjunctiveClusters = mood ? detectConjunctiveClusters(mood.aggregate) : null;
   const classification = await computeQueryClassification(supabase, query || '');
   // Entry 35/40. Reuses the mood signal already computed above (acclaim is
   // just another emotion key in the same lexicon table -- see
@@ -337,6 +343,7 @@ async function runManga({ query, filters, supabase }) {
       boostGenres: routing.boostGenres,
       moodMatchedTerms,
       acclaimIntensity: acclaim.intensity,
+      conjunctiveClusters,
     });
 
     const contributingSourcesFO = MANGA_SOURCES
@@ -402,6 +409,7 @@ async function runManga({ query, filters, supabase }) {
       boostGenres: routing.boostGenres,
       moodMatchedTerms,
       acclaimIntensity: acclaim.intensity,
+      conjunctiveClusters,
     });
 
     const hasMore = accumulated.length >= limit && anySourceHadFullRawPage;
