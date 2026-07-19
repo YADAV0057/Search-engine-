@@ -11,6 +11,7 @@ import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerm
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
 import { detectReferenceTitle } from './parser/referenceTitle.js';
 import { getEmotionalIntentFallback } from './parser/emotionalIntentFallback.js';
+import { getIdiomFallback } from './parser/idiomFallback.js';
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -176,7 +177,8 @@ async function computeMoodSignal(supabase, rawQuery, groqApiKey, cerebrasApiKey)
   if (tokens.length === 0) return null;
 
   try {
-    const { aggregate, negatedAggregate, perToken } = await analyzeQueryMood(supabase, tokens);
+    const { aggregate, negatedAggregate, perToken, cleanTokens, claimed, negated } =
+      await analyzeQueryMood(supabase, tokens);
     // Entry 39 fix: this used to bail to null whenever `aggregate` (positive
     // signal) was empty -- which is exactly what happens for a query that's
     // ALL negation, e.g. "I don't want anything sad" (Entry 34 correctly
@@ -199,12 +201,38 @@ async function computeMoodSignal(supabase, rawQuery, groqApiKey, cerebrasApiKey)
       // header for the full design. Fails closed to null on any error,
       // missing key, or non-emotional query, so this can never block or
       // degrade a search that isn't asking for it.
+      //
+      // Entry 61: idiom-span fallback runs first here too (before the
+      // whole-query emotional-intent fallback) -- "slow burn" alone, with
+      // no other emotional words in the query, is exactly the empty-
+      // aggregate case this branch handles, and a phrase-level match is a
+      // better signal than a whole-sentence one when it's available.
+      const idiomOnly = await getIdiomFallback(cleanTokens, claimed, negated, groqApiKey, cerebrasApiKey, supabase);
+      if (idiomOnly) return idiomOnly;
       return await getEmotionalIntentFallback(rawQuery, tokens, groqApiKey, cerebrasApiKey, supabase);
     }
+
+    // Entry 61: idiom-span fallback runs ADDITIVELY here, unlike
+    // emotionalIntentFallback.js above -- a query can have real AFINN/
+    // lexicon signal from other words ("sad slow burn romance") and still
+    // contain an idiom span nothing else covered. Merges into the same
+    // aggregate with a plain per-key sum, same as analyzeQueryMood()'s own
+    // matches are summed. Never throws/blocks: getIdiomFallback() already
+    // fails closed to null on any error or missing key.
+    const idiomSignal = await getIdiomFallback(cleanTokens, claimed, negated, groqApiKey, cerebrasApiKey, supabase);
+    const mergedAggregate = { ...aggregate };
+    const matchedTerms = perToken.filter((t) => t.source);
+    if (idiomSignal) {
+      for (const [key, weight] of Object.entries(idiomSignal.aggregate)) {
+        mergedAggregate[key] = (mergedAggregate[key] || 0) + weight;
+      }
+      matchedTerms.push(...idiomSignal.matchedTerms);
+    }
+
     return {
-      aggregate,
+      aggregate: mergedAggregate,
       negatedAggregate: negatedAggregate || {},
-      matchedTerms: perToken.filter((t) => t.source),
+      matchedTerms,
     };
   } catch (err) {
     console.error('[domains] mood analysis failed', err);
