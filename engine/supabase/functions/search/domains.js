@@ -10,6 +10,7 @@ import { rankResults } from './parser/rankResults.js';
 import { classifyQuery, rankCategories, hasStrongTitleMatch, getNegatedGenreTerms } from './parser/queryClassifier.js';
 import { computeAcclaimIntensity } from './parser/acclaimScoring.js';
 import { detectReferenceTitle } from './parser/referenceTitle.js';
+import { getEmotionalIntentFallback } from './parser/emotionalIntentFallback.js';
 
 const DEFAULT_PAGE = 1;
 const DEFAULT_LIMIT = 10;
@@ -169,7 +170,7 @@ function applyMoodGenreRouting(basicPlan, cleanQuery, filters, routing, classifi
   return basicPlan;
 }
 
-async function computeMoodSignal(supabase, rawQuery) {
+async function computeMoodSignal(supabase, rawQuery, groqApiKey, cerebrasApiKey) {
   if (!supabase || !rawQuery) return null;
   const tokens = normalizeAndTokenize(rawQuery);
   if (tokens.length === 0) return null;
@@ -186,7 +187,20 @@ async function computeMoodSignal(supabase, rawQuery) {
     // Now: only bail if BOTH are empty.
     const hasPositive = Object.keys(aggregate).length > 0;
     const hasNegated = Object.keys(negatedAggregate || {}).length > 0;
-    if (!hasPositive && !hasNegated) return null;
+    if (!hasPositive && !hasNegated) {
+      // Entry 49 gap #5 fix. The lexicon/AFINN tier found genuinely
+      // nothing -- e.g. "I just want someone to stay", where "stay" isn't
+      // AFINN-scored and "want" is a stopword. Previously this returned
+      // null here unconditionally, and the query fell through to a
+      // literal free-text search (the Entry 31/32 bug again, reached via
+      // an empty-lexicon-coverage path this time instead of a negation
+      // edge case). Fall back to a Groq/Cerebras classification of the
+      // query's emotional intent -- see emotionalIntentFallback.js's
+      // header for the full design. Fails closed to null on any error,
+      // missing key, or non-emotional query, so this can never block or
+      // degrade a search that isn't asking for it.
+      return await getEmotionalIntentFallback(rawQuery, tokens, groqApiKey, cerebrasApiKey, supabase);
+    }
     return {
       aggregate,
       negatedAggregate: negatedAggregate || {},
@@ -296,7 +310,12 @@ async function resolveReferenceTitle(reference, cleanQuery, filters) {
 async function runManga({ query, filters, supabase }) {
   const cleanQuery = normalize(query || '');
   const queryTokens = normalizeAndTokenize(query || '');
-  const mood = await computeMoodSignal(supabase, query || '');
+  const mood = await computeMoodSignal(
+    supabase,
+    query || '',
+    Deno.env.get('GROQ_API_KEY'),
+    Deno.env.get('CEREBRAS_API_KEY')
+  );
   const routing = mood ? getRoutingForMood(mood.aggregate) : { boostGenres: [], excludeGenres: [] };
   // Entry 39: a second routing pass, over the NEGATED aggregate. We only
   // take its boostGenres -- the genres that emotion would have boosted had
