@@ -38,6 +38,14 @@
 // mood" note, extended here to the two new fields), not something this
 // change alters.
 //
+// FIX 2026-07-19 (Entry 59): `acclaim` and `referenceTitle` were already
+// being returned by domains.js's runManga() (Entry 35/40 and Entry 49 gap
+// #4 respectively) but this file's destructuring/response object were
+// never updated to match — both were silently dropped before ever
+// reaching the HTTP response, same class of gap this entry's fix
+// (`moodTags`) would otherwise have introduced a third instance of. All
+// three are included below now.
+//
 // FIXED 2026-07-18 (frontend/backend contract mismatch): this validation
 // used to be `if (!query || typeof query !== 'string')`, which rejects an
 // EMPTY string query with a 400 — but a filters-only browse request (no
@@ -126,7 +134,7 @@ Deno.serve(async (req) => {
       return json({ results: cachedResults, cached: true, hasMore }, 200, cors);
     }
 
-    const { source, results, mood, page, hasMore, routing, classification } =
+    const { source, results, mood, page, hasMore, routing, classification, acclaim, referenceTitle, moodTags } =
       await handler.run({ query, filters, supabase });
 
     // Don't cache empty/failed results — a transient upstream miss
@@ -139,7 +147,7 @@ Deno.serve(async (req) => {
     }
 
     return json(
-      { results, cached: false, source, mood, page, hasMore, routing, classification },
+      { results, cached: false, source, mood, page, hasMore, routing, classification, acclaim, referenceTitle, moodTags },
       200,
       cors
     );
