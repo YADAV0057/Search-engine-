@@ -1,6 +1,7 @@
 import { getAfinnScore } from './dictionary/afinn.js';
-import { normalizeAndTokenize, normalize } from './normalize.js'; 
+import { normalizeAndTokenize, normalize } from './normalize.js';
 import { similarity } from './fuzzyMatch.js';
+import { computeNegationMask } from './negation.js';
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const PAGE_SIZE = 1000;
@@ -8,7 +9,7 @@ const PAGE_SIZE = 1000;
 const MIN_SIGNIFICANT_WORD_LENGTH = 4;
 
 // Entry 33 fix: how similar the full query needs to be to an actual title
-// (via fuzzyMatch.js's similarity(), same Levenshtein-based scorer used for 
+// (via fuzzyMatch.js's similarity(), same Levenshtein-based scorer used for
 // typo correction) before we trust it as a real title search. The old
 // "any single ≥4-letter word overlaps any of 9,912 titles" check
 // (matchesCategoryPhrase, still used below for building the *candidate*
@@ -27,6 +28,18 @@ const CATEGORY_ENTITY_TYPES = {
   GENRE: ['genre'],
   TAG: ['tag', 'theme', 'demographic']
 };
+
+// Exclusion-system pass (QA finding #1). Negation is only ever ACTED on for
+// these two categories -- excluding a GENRE/TAG is a real, well-defined
+// request ("anything except horror" -> genre_not_in) with an existing hard-
+// filter mechanism already wired all the way to the adapters
+// (plan.excludedGenres). Negating a TITLE/AUTHOR/CHARACTER match ("not
+// Naruto") doesn't have an equivalent mechanism today and is a much murkier
+// ask besides -- left as a possible future addition, not silently
+// mishandled here. negatedMatches is still computed uniformly below for
+// every category (simplest code path), domains.js just only ever reads it
+// off GENRE/TAG.
+const NEGATABLE_CATEGORIES = new Set(['GENRE', 'TAG']);
 
 let cache = null;
 let cacheLoadedAt = 0;
@@ -101,14 +114,45 @@ async function warmCache(supabase) {
   return warmingPromise;
 }
 
-function matchesCategoryPhrase(queryTokenSet, vocabEntries) {
+// Exclusion-system pass. Previously took a Set (queryTokenSet) and just
+// checked overlap -- couldn't tell WHERE in the query a match came from, so
+// couldn't tell whether that position was negated. Now takes the token
+// array plus the negation mask computed once per query, and tracks every
+// query-token INDEX each entity's tokens hit, not just whether they hit.
+//
+// A category match counts as negated only if EVERY position it hit in the
+// query is negated -- if the same genre word appears twice in a query and
+// only one mention is negated, the positive mention wins (conservative:
+// avoids accidentally excluding something the person also affirmatively
+// asked for). The common case -- one mention, e.g. "anything except
+// horror" -- just has exactly one hit position to check.
+function matchesCategoryPhrase(queryTokens, negated, vocabEntries) {
+  const positionsByToken = new Map();
+  queryTokens.forEach((t, i) => {
+    if (!positionsByToken.has(t)) positionsByToken.set(t, []);
+    positionsByToken.get(t).push(i);
+  });
+
   const matches = [];
+  const negatedMatches = [];
+
   for (const entry of vocabEntries) {
-    if (entry.tokens.some((t) => queryTokenSet.has(t))) {
+    const hitPositions = [];
+    for (const t of entry.tokens) {
+      const positions = positionsByToken.get(t);
+      if (positions) hitPositions.push(...positions);
+    }
+    if (hitPositions.length === 0) continue;
+
+    const anyPositive = hitPositions.some((i) => !negated[i]);
+    if (anyPositive) {
       matches.push(entry.name);
+    } else {
+      negatedMatches.push(entry.name);
     }
   }
-  return matches;
+
+  return { matches, negatedMatches };
 }
 
 function scoreEmotion(queryTokens) {
@@ -124,15 +168,31 @@ export async function classifyQuery(supabase, rawQuery) {
   const queryTokens = normalizeAndTokenize(rawQuery || '');
   if (queryTokens.length === 0) return {};
 
-  const queryTokenSet = new Set(queryTokens);
+  // Exclusion-system pass: computed once, reused for every category below,
+  // same trigger list moodLexicon.js uses (shared via parser/negation.js)
+  // plus the additions ("except"/"excluding"/"avoid"/"hate"/"dislike")
+  // that pass added -- see negation.js's header for the full rationale.
+  const negated = computeNegationMask(queryTokens);
   const vocabByCategory = await warmCache(supabase);
 
   const scores = {};
 
   for (const [category, entries] of vocabByCategory.entries()) {
-    const matches = matchesCategoryPhrase(queryTokenSet, entries);
-    if (matches.length > 0) {
-      scores[category] = { score: matches.length, matches };
+    const { matches, negatedMatches } = matchesCategoryPhrase(queryTokens, negated, entries);
+    if (matches.length > 0 || negatedMatches.length > 0) {
+      // score is deliberately based on POSITIVE matches only -- an
+      // entirely-negated category (e.g. GENRE for "anything except
+      // horror", where the only hit is negated) contributes 0 to
+      // rankResults.js's computeRankingWeights() weight budget for that
+      // category. That's correct: a negated genre isn't something to rank
+      // BY, it's a hard filter handled separately in domains.js/
+      // plan.excludedGenres. Falling through to an even weight split when
+      // every category nets to 0 (already existing fallback behavior in
+      // computeRankingWeights) degrades gracefully to a plain popularity
+      // browse of whatever survives the exclusion filter -- the right
+      // behavior for a query like "anything except horror" that has no
+      // positive signal beyond the exclusion itself.
+      scores[category] = { score: matches.length, matches, negatedMatches };
     }
   }
 
@@ -148,6 +208,21 @@ export function rankCategories(scores) {
   return Object.entries(scores)
     .map(([category, { score }]) => ({ category, score }))
     .sort((a, b) => b.score - a.score);
+}
+
+// Exclusion-system pass. Collects negatedMatches off the two categories
+// it's actually safe/meaningful to hard-exclude on (see NEGATABLE_CATEGORIES
+// above). Returns a flat, deduped array of genre/tag NAMES -- domains.js
+// merges this straight into plan.excludedGenres alongside the existing
+// mood-negation and filter-panel exclusion sources.
+export function getNegatedGenreTerms(scores) {
+  const out = new Set();
+  for (const category of NEGATABLE_CATEGORIES) {
+    const negatedMatches = scores?.[category]?.negatedMatches;
+    if (!negatedMatches) continue;
+    for (const name of negatedMatches) out.add(name);
+  }
+  return [...out];
 }
 
 // Entry 33 fix. Takes the TITLE category's word-bag matches (candidate
