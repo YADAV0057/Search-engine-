@@ -154,7 +154,22 @@ export async function analyzeQueryMood(supabase, tokens) {
     }
   }
 
-  return { perToken: matches, aggregate, negatedAggregate, negatedTerms: negatedMatches };
+  // ADDED (Entry 61, idiom-fallback scoping): cleanTokens/claimed/negated
+  // were already computed above for this function's own use -- exposing
+  // them (read-only, nothing recomputed) lets parser/idiomFallback.js find
+  // which token spans got NO coverage at all (no lexicon phrase, no AFINN
+  // word) without duplicating the claiming/negation logic here. Purely
+  // additive: every existing caller that destructures only the original
+  // four fields is unaffected.
+  return {
+    perToken: matches,
+    aggregate,
+    negatedAggregate,
+    negatedTerms: negatedMatches,
+    cleanTokens,
+    claimed,
+    negated,
+  };
 }
 
 export async function getEmotionsForTerm(supabase, term) {
