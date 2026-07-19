@@ -117,19 +117,47 @@ export function detectConjunctiveClusters(aggregate) {
   return null;
 }
 
+// Entry 66 (2026-07-19, by Claude): getRoutingForMood() also returns
+// `emotionGenreMap` now -- the per-emotion {weight, genres} list BEFORE
+// it gets fanned out and collapsed into the flat `boostGenres` pool below.
+//
+// Root cause this fixes: `boostGenres` sums each emotion's weight into
+// EVERY genre it maps to, so an emotion mapped to 3 genres (e.g. `tension`
+// -> thriller/mystery/psychological) contributes 3x more pool mass per
+// unit of weight than an emotion mapped to 1 genre (e.g. `romance` ->
+// romance), even though the lexicon never said tension mattered 3x more.
+// `emotionMatchScore()` in rankResults.js then divides by that inflated
+// pool total, so a candidate's score depends on how many genres an
+// emotion happens to map to in this table, not on the lexicon's actual
+// {romance:7, tension:4} weights. Concretely: "Enemies To Lovers"
+// ({romance:7, tension:4}) let a candidate with zero romance content but
+// all 3 tension-genres (Thriller+Mystery+Psychological) outscore a real
+// romance drama with fewer total genre tags -- see Backend Update List
+// Entry 63/65/66 for the full repro.
+//
+// `emotionGenreMap` preserves each emotion as one undivided unit so
+// rankResults.js can cap its contribution at its own lexicon weight
+// regardless of how many genres it fans out to. `boostGenres` is
+// UNCHANGED and kept as-is -- applyMoodBoost(), the response's `routing`
+// field (aiPanel.js's "why" display), and negatedRouting's exclude-genre
+// derivation all still use the flat pool exactly as before; only
+// rankResults.js's emotionMatchScore() switches to the new field.
 export function getRoutingForMood(aggregate) {
   if (!aggregate || Object.keys(aggregate).length === 0) {
-    return { boostGenres: [], excludeGenres: [] };
+    return { boostGenres: [], excludeGenres: [], emotionGenreMap: [] };
   }
 
   const boostWeights = new Map();
   const excludeSet = new Set();
+  const emotionGenreMap = [];
 
   for (const [emotion, intensity] of Object.entries(aggregate)) {
     const routing = MANGA_ROUTING[emotion.toLowerCase()];
     if (!routing) continue;
 
     const weight = typeof intensity === 'number' ? intensity : 1;
+
+    emotionGenreMap.push({ emotion, weight, genres: routing.boost });
 
     for (const genre of routing.boost) {
       boostWeights.set(genre, (boostWeights.get(genre) || 0) + weight);
@@ -147,5 +175,5 @@ export function getRoutingForMood(aggregate) {
     .map(([genre, weight]) => ({ genre, weight }))
     .sort((a, b) => b.weight - a.weight);
 
-  return { boostGenres, excludeGenres: [...excludeSet] };
+  return { boostGenres, excludeGenres: [...excludeSet], emotionGenreMap };
 }
