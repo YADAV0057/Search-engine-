@@ -249,10 +249,26 @@ async function writeBackToLexicon(supabase, query, emotionKey, keywords, provide
   if (!term) return;
 
   try {
+    // Entry 60 fix (Notion "Backend Update List"): scoped by entity_type,
+    // where it previously wasn't. manga_emotion_lexicon's `normalized_term`
+    // is a table-wide unique/onConflict key shared with acclaimScoring.js's
+    // OWN writeBackToLexicon() (entity_type='acclaim_phrase', a completely
+    // separate classification feature) -- an unscoped fetch here would pull
+    // in and merge whatever acclaimScoring wrote for the same query text
+    // (e.g. {acclaim: 9}) into what should be a pure comfort/mood
+    // classification, corrupting `emotions` with a key that isn't even a
+    // valid MANGA_ROUTING entry. getWrittenBackClassification() below then
+    // has no way to tell the difference on a later cache hit -- it just
+    // trusts Object.keys(emotions)[0], and whichever feature happened to
+    // write first wins, silently. Repro: "I want to believe people can
+    // stay" -> emotions ended up {acclaim: 9, comfort: 5}, acclaim: 9
+    // written first by acclaimScoring.js, so the cache hit routed as
+    // "acclaim" (zero MANGA_ROUTING genre boost) instead of "comfort".
     const { data: existing, error: fetchErr } = await supabase
       .from('manga_emotion_lexicon')
       .select('emotions, keywords')
       .eq('normalized_term', term)
+      .eq('entity_type', 'mood_word')
       .maybeSingle();
 
     if (fetchErr) {
@@ -282,7 +298,12 @@ async function writeBackToLexicon(supabase, query, emotionKey, keywords, provide
           keywords: mergedKeywords,
           source: `emotional_intent_writeback:${provider}`,
         },
-        { onConflict: 'normalized_term' }
+        // Entry 60 fix: was onConflict:'normalized_term' -- the table-wide
+        // uniqueness that let this collide with acclaimScoring.js's
+        // entity_type='acclaim_phrase' rows for the same query text. See
+        // this file's writeBackToLexicon() header and the migration that
+        // added the composite unique constraint this now targets.
+        { onConflict: 'normalized_term,entity_type' }
       );
 
     if (upsertErr) {
@@ -333,7 +354,16 @@ async function getWrittenBackClassification(supabase, term) {
     }
     if (!data || !data.emotions) return null;
 
-    const emotionKeys = Object.keys(data.emotions);
+    // Entry 60 defense-in-depth: the write-path fix (entity_type scoping +
+    // composite unique constraint, see writeBackToLexicon() above) stops
+    // new contamination, but doesn't retroactively repair it -- filter to
+    // keys this module could actually have written (valid ROUTING_KEYS
+    // entries) rather than trusting insertion order on whatever's in the
+    // row. A row with no valid key left (fully displaced by a stale
+    // contamination) falls through to null -- caller re-classifies fresh
+    // via Groq/Cerebras rather than silently acting on an untrustworthy
+    // cached key, same fail-safe default as every other error path here.
+    const emotionKeys = Object.keys(data.emotions).filter((k) => ROUTING_KEYS.includes(k));
     if (emotionKeys.length === 0) return null;
 
     // This module's writeBackToLexicon() only ever sets one key per call,
