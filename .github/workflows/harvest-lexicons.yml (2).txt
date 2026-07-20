@@ -1,0 +1,104 @@
+# SAVE AS: .github/workflows/harvest-lexicons.yml  (repo root — alongside deploy.yml)
+#
+# Calls the deployed harvest-lexicons Edge Function via curl. Two ways to
+# trigger it:
+#   1. Manually — GitHub repo -> Actions tab -> "Harvest Lexicons" ->
+#      "Run workflow" -> optionally fill entity_types -> Run workflow.
+#      Leave entity_types blank to harvest everything.
+#   2. Automatically — runs every 6 hours (UTC) via the `schedule` trigger
+#      below. Scheduled runs ALWAYS harvest everything (entity_types is
+#      forced blank for these — see the ENTITY_TYPES_INPUT guard below),
+#      so genre/tag/staff/character/studio/media/media_mangadex/synonym
+#      all get covered on their own, with no risk of a human forgetting
+#      to include one of them.
+#
+# One-time setup before this will work (same as before — nothing new needed
+# for the schedule trigger itself):
+#   1. Repo secret SUPABASE_PROJECT_ID   — your project ref (same secret
+#      deploy.yml already uses — no need for a second one)
+#      (Supabase Dashboard > Project Settings > General > Project ID)
+#   2. Repo secret HARVEST_SECRET        — same value you set as the
+#      harvest-lexicons function secret in the Supabase Dashboard
+#      (Edge Functions > harvest-lexicons > Secrets)
+#   (Settings > Secrets and variables > Actions, in this GitHub repo)
+#
+# WHY EVERY 6 HOURS: character/studio/AniList-media had never been
+# harvested at all before this fix (see project Notion, "Backend Update
+# List" Entries 37-38), so the first several scheduled runs are a cold
+# backfill, not just incremental delta syncs. Per-page checkpointing in
+# harvest-lexicons/index.ts (setSyncState() after every page) means a run
+# that gets cut off by the ~150s Edge Function timeout resumes exactly
+# where it left off on the next scheduled run — no restart-from-zero risk,
+# and upserts are idempotent on (entity_type, source_id), so nothing gets
+# double-counted either. Once caught up, the ID_DESC delta strategy makes
+# each run cheap, so 6 hours stays comfortable long-term too, not just
+# during the backfill. Recommended one-time step: trigger this manually
+# once with entity_types left blank right after merging this change, so
+# the backfill starts immediately instead of waiting for the next tick.
+#
+# Rate limits checked against this cadence: AniList allows 90 req/min;
+# this workflow paces itself at 750ms/request (~80/min) and caps any
+# single run at MAX_PAGES_PER_RUN=200 requests — a 6-hour cadence gives
+# large headroom under both AniList's and Datamuse's (100k/day) limits.
+
+name: Harvest Lexicons
+
+on:
+  workflow_dispatch:
+    inputs:
+      entity_types:
+        description: 'Comma-separated entity types (blank = all: genre,tag,staff,character,studio,media,media_mangadex,synonym)'
+        required: false
+        default: ''
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours, UTC — always harvests everything (see ENTITY_TYPES_INPUT guard below)
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call harvest-lexicons
+        env:
+          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_ID }}
+          HARVEST_SECRET: ${{ secrets.HARVEST_SECRET }}
+          # Guarded: the `inputs` context is only populated for
+          # workflow_dispatch/workflow_call triggers. On a schedule-triggered
+          # run this evaluates to '' — exactly what we want, since blank
+          # means "harvest everything" per the function's own ALL_ENTITY_TYPES
+          # default. Without this guard, referencing inputs.entity_types on a
+          # non-workflow_dispatch trigger risks an "Unrecognized named-value"
+          # expression error instead of just being empty.
+          ENTITY_TYPES_INPUT: ${{ github.event_name == 'workflow_dispatch' && inputs.entity_types || '' }}
+        run: |
+          # Build the JSON body: {} for "harvest everything" (the function's
+          # own default), or {"entityTypes":[...]} if specific types were
+          # entered in the workflow_dispatch form.
+          if [ -z "$ENTITY_TYPES_INPUT" ]; then
+            BODY='{}'
+          else
+            # Turn "genre, media" into ["genre","media"]
+            TYPES_JSON=$(echo "$ENTITY_TYPES_INPUT" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | grep -v '^$' | jq -R . | jq -s .)
+            BODY=$(jq -n --argjson types "$TYPES_JSON" '{entityTypes: $types}')
+          fi
+
+          echo "Request body: $BODY"
+
+          HTTP_CODE=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST "https://${SUPABASE_PROJECT_REF}.functions.supabase.co/harvest-lexicons" \
+            -H "x-harvest-secret: ${HARVEST_SECRET}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          echo "---- Response ($HTTP_CODE) ----"
+          cat response.json
+          echo ""
+
+          # Long harvest runs (e.g. first-ever media/character/studio
+          # pagination) can hit the Edge Function's execution time limit and
+          # return a 500/partial result — that's expected and safe, not a
+          # bug. The next scheduled run (or a manual re-run) picks up where
+          # this one stopped, since lexicon_sync_state already has the delta
+          # checkpoint — it doesn't restart from zero.
+          if [ "$HTTP_CODE" -ge 400 ]; then
+            echo "::warning::harvest-lexicons returned $HTTP_CODE — if this was a timeout on a large backfill run, that's expected; the next run (scheduled or manual) resumes from lexicon_sync_state instead of restarting."
+          fi
