@@ -473,6 +473,27 @@ const MAX_SPANS_PER_QUERY = 2;  // cap LLM calls per request, longest spans firs
  * (the two drift and nobody notices), worth factoring out to a shared
  * parser/spanExtraction.js -- not done here, same "flag, don't yet fix"
  * pattern as this file's other open items.
+ *
+ * BUGFIX (2026-07-20, found via a live production row): an uncovered run
+ * LONGER than MAX_SPAN_WORDS used to be left-chunked into consecutive
+ * MAX_SPAN_WORDS-sized windows (e.g. a 5-word run -> one 4-word span +
+ * one 1-word leftover). For a real query -- "Something that feels like a
+ * warm cup of tea" -- the uncovered run was "a warm cup of tea" (5 words),
+ * which chunked into "a warm cup of" (4 words, span pushed) + "tea"
+ * (1 word, dropped for being under MIN_SPAN_WORDS). The LLM then received
+ * the truncated fragment MINUS the one word that made it mean anything,
+ * misclassified "a warm cup of" as a real trope, and wrote back a false
+ * {Drama, Slice of Life} signature that now pollutes every future "warm
+ * cup of X" query too (see this file's own writeback code -- an existing
+ * row is trusted, never re-classified).
+ *
+ * FIX: a run longer than MAX_SPAN_WORDS is now skipped entirely rather
+ * than chunked. Real trope names are essentially never more than 4 words
+ * ("enemies to lovers" is 3; "isekai reincarnation" is 2) -- an uncovered
+ * run longer than that is far more likely a whole descriptive/idiom
+ * sentence fragment, which is emotionalIntentFallback.js's/
+ * idiomFallback.js's territory, not this file's. Silently truncating it
+ * to fit was the actual bug, not a reasonable fallback.
  */
 function extractCandidateSpans(cleanTokens, claimed, negated) {
   const spans = [];
@@ -482,12 +503,11 @@ function extractCandidateSpans(cleanTokens, claimed, negated) {
     if (runStart === null) return;
     const runTokens = cleanTokens.slice(runStart, end);
     const meaningful = runTokens.filter((t) => !STOPWORDS.has(t));
-    if (meaningful.length >= MIN_SPAN_WORDS) {
-      for (let start = runStart; start < end; start += MAX_SPAN_WORDS) {
-        const chunk = cleanTokens.slice(start, Math.min(start + MAX_SPAN_WORDS, end));
-        if (chunk.length >= MIN_SPAN_WORDS) spans.push(chunk.join(' '));
-      }
+    if (meaningful.length >= MIN_SPAN_WORDS && meaningful.length <= MAX_SPAN_WORDS) {
+      spans.push(runTokens.join(' '));
     }
+    // meaningful.length > MAX_SPAN_WORDS: deliberately dropped, not
+    // chunked -- see BUGFIX note above.
     runStart = null;
   };
 
