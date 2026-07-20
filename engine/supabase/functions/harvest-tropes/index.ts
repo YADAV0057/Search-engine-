@@ -3,8 +3,8 @@
 // supabase/functions/harvest-tropes/index.ts 
 // ========================================== 
 // POST /harvest-tropes   (header: x-harvest-secret: <HARVEST_SECRET>)
-// { "mode": "bootstrap" }   (optional, default: bootstrap)
-// -> { "results": { "bootstrap": { checked, seeded, skippedExisting, skippedLowConfidence }, "searchCacheScan": {...} } }
+// { "mode": "bootstrap" | "reclassify_thin" | "all", "limit": 25 }
+// -> { "results": { "bootstrap": {...}, "reclassifyThin": {...}, "searchCacheScan": {...} } }
 //
 // Notion "Backend Update List" Entry 71/72 -- Component 2 of the two-part
 // trope-signature system (Component 1 is search/parser/tropeSignature.js's
@@ -32,33 +32,38 @@
 // open items at the bottom.
 //
 // ============================================================
-// KNOWN GAP, FOUND WHILE BUILDING THIS (verify-against-live-schema catch,
-// same practice as Entry 55/56): Entry 59's original Component 2 design
-// said this should "scan recent search_cache entries for 2-4 word phrases
-// that produced zero lexicon coverage." Checked cache.js directly before
-// writing this file -- search_cache stores `query_hash` (a SHA-256 digest
-// of domain+normalized-query+filters), NOT the raw query text. There is
-// currently NO live table anywhere in this project that stores what
-// people actually typed. This means the search_cache-scanning half of
-// Component 2, AS ORIGINALLY SCOPED, cannot be built against the current
-// schema -- there is nothing to scan.
+// KNOWN GAP (unchanged from v4): search_cache stores only a SHA-256
+// query_hash, not raw query text -- the near-miss-scanning half of
+// Component 2 still can't be built against the current schema. See
+// searchCacheScan's response field below.
+// ============================================================
 //
-// NOT fixed here (a real design decision, not a quick patch):
-//   (a) Add a new lightweight raw-query log table (e.g. `search_query_log`,
-//       domain + raw query text + timestamp, no results/PII beyond the
-//       query string itself) that the search function writes to
-//       alongside search_cache -- needs repo owner sign-off given it's a
-//       new persisted data category, not just an index/column addition.
-//   (b) Skip the near-miss-scanning half entirely and rely on Component 1
-//       (the live query-time fallback, already wired and already writing
-//       back confident matches) as the sole organic-growth mechanism --
-//       cheaper, no schema change, but slower to reach broad coverage
-//       since it only ever sees phrases that happen to occur in a live
-//       search.
-// This file implements ONLY the bootstrap-seeding half below, which has
-// no such dependency, and reports the scan half as not_implemented with
-// this reason in its own response field rather than silently doing
-// nothing.
+// ============================================================
+// ADDED 2026-07-20 (Entry 74) -- "reclassify_thin" mode.
+// Found while investigating still-weak trope search results: the 300
+// rows manually seeded in batches 1-2 (source 'ai_generated_by_claude_
+// directly') were written directly to trope_signatures by a past session,
+// OUTSIDE this project's actual constrained-vocabulary classifier --
+// averaging 0.81 tags/row, with 92% of rows having at most ONE tag (many
+// have zero, relying on 1-2 broad genre weights alone). Because
+// getTropeSignatureFallback() in tropeSignature.js treats any EXISTING
+// trope_signatures row as final and never re-classifies it, these thin
+// legacy rows permanently block the real LLM pipeline from ever
+// improving them, no matter how many times the term gets searched live.
+//
+// This mode finds rows below a tag-count threshold and re-runs them
+// through the same classifyTrope() pipeline as bootstrap, OVERWRITING
+// (not skipping) if a richer result comes back -- the one place in this
+// file that intentionally clobbers an existing row, which is why it's a
+// separate opt-in mode rather than folded into runBootstrap()'s
+// skip-if-existing behavior.
+//
+// Processes at most `limit` rows per invocation (default 25, same
+// "small enough to not risk the timeout ceiling harvest-lexicons has
+// already hit at 44-88s on heavier runs" reasoning) rather than trying
+// to fix all 275 thin rows in one call -- run it repeatedly (e.g. on the
+// same 6-hour cron as harvest-lexicons, or manually) until
+// reclassifyThin's `remaining` count reaches 0.
 // ============================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
@@ -86,7 +91,9 @@ const GEMINI_URL = (apiKey: string) =>
 
 const PROVIDER_TIMEOUT_MS = 3000;
 const WRITEBACK_THRESHOLD = 0.75; // same bar as tropeSignature.js's query-time path
-const LLM_CALL_GAP_MS = 500; // politeness gap between bootstrap classifications, same spirit as harvest-lexicons' DATAMUSE_REQUEST_GAP_MS
+const LLM_CALL_GAP_MS = 500; // politeness gap between classifications, same spirit as harvest-lexicons' DATAMUSE_REQUEST_GAP_MS
+const DEFAULT_RECLASSIFY_LIMIT = 25; // rows per invocation -- see header note on timeout risk
+const THIN_TAG_THRESHOLD = 1; // a row with <= this many tags is "thin" and eligible for reclassification
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -367,6 +374,97 @@ async function runBootstrap() {
   return { checked, seeded, skippedExisting, skippedLowConfidence, skippedNoSignal };
 }
 
+// ---- Reclassify-thin pass (Entry 74) ----
+//
+// Finds rows with <= THIN_TAG_THRESHOLD tags (regardless of source --
+// bootstrap-seeded rows could theoretically also end up thin if the LLM
+// legitimately found few adjacent tags, though in practice this is
+// overwhelmingly the 'ai_generated_by_claude_directly' batch-1/2 rows),
+// re-classifies each via the real pipeline, and OVERWRITES if the new
+// result is an improvement (strictly more tags, or equal tags but more
+// genres -- never overwrites with something equal-or-worse, so a
+// legitimately sparse real classification from the LLM itself doesn't
+// get re-tried forever).
+async function runReclassifyThin(limit: number) {
+  const [tagNames, genreNames] = await Promise.all([getTagVocabNames(), getGenreVocabNames()]);
+
+  // jsonb_object_keys(...) count done client-side after fetch rather than
+  // in the WHERE clause -- keeps this readable without leaning on a
+  // Postgres-specific expression index that doesn't exist yet on
+  // tag_weights's key count.
+  const { data: candidates, error: fetchErr } = await supabase
+    .from('trope_signatures')
+    .select('term, normalized_term, tag_weights, genre_weights, source')
+    .order('term', { ascending: true });
+
+  if (fetchErr) throw fetchErr;
+
+  const thin = (candidates || []).filter(
+    (row: { tag_weights: Record<string, number> | null }) =>
+      Object.keys(row.tag_weights || {}).length <= THIN_TAG_THRESHOLD
+  );
+
+  const totalThin = thin.length;
+  const batch = thin.slice(0, limit);
+
+  let reclassified = 0;
+  let improved = 0;
+  let noImprovement = 0;
+  let noSignal = 0;
+
+  for (const row of batch) {
+    if (!GROQ_API_KEY && !CEREBRAS_API_KEY && !GEMINI_API_KEY) break;
+
+    const result = await classifyTrope(row.term, tagNames, genreNames);
+    reclassified++;
+
+    if (!result || result.confidence < WRITEBACK_THRESHOLD) {
+      noSignal++;
+      await sleep(LLM_CALL_GAP_MS);
+      continue;
+    }
+
+    const oldTagCount = Object.keys(row.tag_weights || {}).length;
+    const oldGenreCount = Object.keys(row.genre_weights || {}).length;
+    const newTagCount = Object.keys(result.tagWeights).length;
+    const newGenreCount = Object.keys(result.genreWeights).length;
+    const isImprovement = newTagCount > oldTagCount || (newTagCount === oldTagCount && newGenreCount > oldGenreCount);
+
+    if (!isImprovement) {
+      noImprovement++;
+      await sleep(LLM_CALL_GAP_MS);
+      continue;
+    }
+
+    const { error: upsertErr } = await supabase
+      .from('trope_signatures')
+      .update({
+        tag_weights: result.tagWeights,
+        genre_weights: result.genreWeights,
+        source: `trope_harvest_reclassify:${result.provider}`
+      })
+      .eq('normalized_term', row.normalized_term);
+
+    if (upsertErr) {
+      console.error(`[harvest-tropes] reclassify update failed for "${row.term}"`, upsertErr);
+    } else {
+      improved++;
+    }
+
+    await sleep(LLM_CALL_GAP_MS);
+  }
+
+  return {
+    totalThinRows: totalThin,
+    processedThisRun: batch.length,
+    remaining: Math.max(0, totalThin - batch.length),
+    reclassified,
+    improved,
+    noImprovement,
+    noSignal
+  };
+}
+
 // ---- Entry point ----
 
 Deno.serve(async (req) => {
@@ -377,19 +475,24 @@ Deno.serve(async (req) => {
     return json({ error: 'Unauthorized' }, 401);
   }
 
-  let body: { mode?: string } = {};
+  let body: { mode?: string; limit?: number } = {};
   try {
     body = await req.json();
   } catch {
     // empty body -> default mode
   }
   const mode = body.mode || 'bootstrap';
+  const limit = Number.isFinite(body.limit) && body.limit! > 0 ? body.limit! : DEFAULT_RECLASSIFY_LIMIT;
 
   const results: Record<string, unknown> = {};
 
   try {
     if (mode === 'bootstrap' || mode === 'all') {
       results.bootstrap = await runBootstrap();
+    }
+
+    if (mode === 'reclassify_thin' || mode === 'all') {
+      results.reclassifyThin = await runReclassifyThin(limit);
     }
 
     // See the KNOWN GAP note at the top of this file -- there is currently
@@ -419,4 +522,3 @@ function json(body: unknown, status: number) {
     headers: { 'Content-Type': 'application/json' }
   });
 }
-
