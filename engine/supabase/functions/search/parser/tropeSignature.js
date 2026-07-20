@@ -1,6 +1,6 @@
 // parser/tropeSignature.js
 //
-// Notion "Backend Update List" Entry 71. Replaces the "wait for the repo
+// Notion "Backend Update List" Entry 71. Replaces the "wait for the repo 
 // owner's 1000-trope source list" plan (Entry 69/70) with an LLM-driven
 // trope-signature generator, generalizing idiomFallback.js's write-back
 // pattern (Entry 61) to the `trope_signatures` table Entry 68 designed.
