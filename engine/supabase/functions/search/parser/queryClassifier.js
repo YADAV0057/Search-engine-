@@ -1,7 +1,7 @@
 import { getAfinnScore } from './dictionary/afinn.js';
 import { normalizeAndTokenize, normalize } from './normalize.js';
 import { similarity } from './fuzzyMatch.js';
-import { computeNegationMask } from './negation.js';
+import { computeNegationMask } from './negation.js'; 
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const PAGE_SIZE = 1000;
