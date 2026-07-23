@@ -1,7 +1,7 @@
 // ==========================================
 // TROPE HARVESTER — Edge Function entry point
-// supabase/functions/harvest-tropes/index.ts 
-// ========================================== 
+// supabase/functions/harvest-tropes/index.ts
+// ==========================================
 // POST /harvest-tropes   (header: x-harvest-secret: <HARVEST_SECRET>)
 // { "mode": "bootstrap" | "reclassify_thin" | "all", "limit": 25 }
 // -> { "results": { "bootstrap": {...}, "reclassifyThin": {...}, "searchCacheScan": {...} } }
@@ -65,6 +65,47 @@
 // same 6-hour cron as harvest-lexicons, or manually) until
 // reclassifyThin's `remaining` count reaches 0.
 // ============================================================
+//
+// ============================================================
+// FIXED 2026-07-20 (Entry 83/84) -- two real bugs found via manual audit,
+// not theoretical:
+//
+// BUG 1 -- this mode was overwriting ALREADY-CURATED rows, not just the
+// legacy 'ai_generated_by_claude_directly' batch it was originally built
+// for. A new source, 'manual_seed_v3' (Entry 78-82), does the same kind
+// of manual seeding but WITH real-vocab verification per term -- these
+// rows are frequently intentionally thin (1 tag, or 0 with genre-only)
+// because no honest real-tag match exists, not because they were
+// carelessly written. THIN_TAG_THRESHOLD-based candidate selection had no
+// source exclusion at all, so it kept re-rolling and overwriting these
+// verified rows right alongside the genuinely-bad legacy ones. Fixed:
+// candidate query now excludes any source starting with 'manual_seed'
+// (matches manual_seed_v3 and any future manual_seed_v4+ line) --
+// curated rows are left alone entirely, on the reasoning that a human/
+// Claude verifying a term against the live vocab before writing it is a
+// stronger signal than an unsupervised re-roll.
+//
+// BUG 2 (the actual root cause of the visible damage) -- buildMessages()
+// below REQUIRED "3-6 tags" on every single classification, with an
+// explicit instruction to "use the closest real adjacent tags rather
+// than returning none" when no exact match exists. That's a forced-
+// padding instruction: it tells the model to invent plausible-but-wrong
+// tags any time fewer than 3 genuinely fit, rather than allowing an
+// honest 1-2-tag (or tag-less, genre-only) result. Confirmed concretely:
+// "amnesia reset" had one precise tag (Amnesia:9) from manual seeding,
+// got reclassified under this prompt, and came back with three vaguer
+// tags (Reincarnation, Alternate Universe, Memory Manipulation) that
+// dropped Amnesia entirely -- isImprovement() then counted 3 > 1 and
+// overwrote it, net effect: a worse, padded result replacing a correct
+// one. Fixed: prompt now allows 1-6 tags and explicitly instructs the
+// model to prefer fewer precise tags over padding, matching the honesty-
+// over-completeness standard this project has been holding itself to in
+// manual seeding since Entry 78 (see the "do NOT force a tag" reasoning
+// there). Also fixed isImprovement() itself so a new result that DROPS
+// an old high-weight (>=7) tag no longer counts as an improvement purely
+// by having a higher total tag count -- tag count was never a real
+// quality proxy on its own, just a convenient one.
+// ============================================================
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -94,6 +135,13 @@ const WRITEBACK_THRESHOLD = 0.75; // same bar as tropeSignature.js's query-time 
 const LLM_CALL_GAP_MS = 500; // politeness gap between classifications, same spirit as harvest-lexicons' DATAMUSE_REQUEST_GAP_MS
 const DEFAULT_RECLASSIFY_LIMIT = 25; // rows per invocation -- see header note on timeout risk
 const THIN_TAG_THRESHOLD = 1; // a row with <= this many tags is "thin" and eligible for reclassification
+// Source prefixes that are exempt from reclassify_thin's candidate scan --
+// see Entry 83/84 header note. Any source string starting with one of
+// these is treated as already-curated and left alone, even if thin.
+const CURATED_SOURCE_PREFIXES = ['manual_seed'];
+// Minimum weight for a tag to count as "high-confidence" for the
+// no-regression check in isImprovement() -- see Entry 83/84.
+const HIGH_CONFIDENCE_TAG_WEIGHT = 7;
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,6 +149,11 @@ function sleep(ms: number) {
 
 function normalize(s: string) {
   return (s || '').toLowerCase().trim().replace(/\s+/g, ' ');
+}
+
+function isCuratedSource(source: string | null | undefined) {
+  const s = (source || '').toLowerCase();
+  return CURATED_SOURCE_PREFIXES.some((prefix) => s.startsWith(prefix));
 }
 
 // ---- Starter trope list (bootstrap seed) ----
@@ -156,7 +209,15 @@ async function getGenreVocabNames(): Promise<string[]> {
 }
 
 // ---- Classification (condensed duplicate of tropeSignature.js -- see header) ----
-
+//
+// Entry 83/84: prompt rewritten to stop forcing a 3-6 tag minimum. The
+// old wording ("3-6 tags", "use the closest real adjacent tags rather
+// than returning none") actively rewarded padding -- an honest 1-tag
+// match would never satisfy the model's own instructions, so it always
+// invented extra adjacent tags to comply, sometimes at the cost of the
+// one tag that was actually correct. This version explicitly tells the
+// model that fewer, precise tags beat more, vague ones, and that 1 tag
+// is a fully valid answer.
 function buildMessages(phrase: string, tagNames: string[], genreNames: string[]) {
   const tagList = tagNames.slice(0, 420).join(', ');
   const genreList = genreNames.slice(0, 40).join(', ');
@@ -171,18 +232,30 @@ function buildMessages(phrase: string, tagNames: string[], genreNames: string[])
         'ordinary adjective pair. If it is NOT a real trope, reply with ' +
         'only the word none.\n\n' +
         'If it IS a real trope, reply in EXACTLY this format and nothing ' +
-        'else: a confidence integer 0-10, then "|", then 3-6 tags chosen ' +
+        'else: a confidence integer 0-10, then "|", then 1-6 tags chosen ' +
         'ONLY from this exact list (comma-separated, each as tag:weight, ' +
         'weight 1-10): ' + tagList + '\n' +
         'then "|", then 1-3 genres chosen ONLY from this exact list ' +
         '(same tag:weight format): ' + genreList + '\n\n' +
+        'IMPORTANT -- precision over quantity: only include a tag if it ' +
+        'is a genuinely close match for the trope\'s actual meaning. A ' +
+        'single precise tag is a complete, correct answer -- do NOT pad ' +
+        'the list with weaker or tangentially-related tags just to reach ' +
+        'a higher count. Including a vague or wrong tag to seem more ' +
+        'thorough is a worse answer than including only the one tag that ' +
+        'truly fits. It is normal and expected for many valid tropes to ' +
+        'have only 1 or 2 real tag matches, or genre weights only with no ' +
+        'tags at all if nothing in the list is a genuine match -- in that ' +
+        'case, still classify the trope (do not reply none just because ' +
+        'the tag list has no exact fit) but leave the tag section as few ' +
+        'entries as honestly justified, even zero.\n\n' +
         'Do not invent tags or genres outside these two lists. Do not name ' +
         'any manga/anime titles anywhere in your answer -- score the ' +
-        'CONCEPT itself, not examples of it. If a real adjacent tag exists ' +
-        'even when no exact-name tag matches the trope, use the closest ' +
-        'real adjacent tags rather than returning none.\n\n' +
-        'Example: "slow burn" -> 9|Slow Burn:6,Romance Subplot:4,Drama:3' +
-        '|Romance:6,Drama:3'
+        'CONCEPT itself, not examples of it.\n\n' +
+        'Example of a good precise answer: "slow burn" -> ' +
+        '8|Unrequited Love:3|Romance:8,Drama:3 -- note this uses only ONE ' +
+        'tag because only one genuinely fits, rather than padding to ' +
+        'reach a higher count.'
     },
     { role: 'user', content: phrase }
   ];
@@ -374,17 +447,17 @@ async function runBootstrap() {
   return { checked, seeded, skippedExisting, skippedLowConfidence, skippedNoSignal };
 }
 
-// ---- Reclassify-thin pass (Entry 74) ----
+// ---- Reclassify-thin pass (Entry 74; fixed Entry 83/84) ----
 //
-// Finds rows with <= THIN_TAG_THRESHOLD tags (regardless of source --
-// bootstrap-seeded rows could theoretically also end up thin if the LLM
-// legitimately found few adjacent tags, though in practice this is
-// overwhelmingly the 'ai_generated_by_claude_directly' batch-1/2 rows),
-// re-classifies each via the real pipeline, and OVERWRITES if the new
-// result is an improvement (strictly more tags, or equal tags but more
-// genres -- never overwrites with something equal-or-worse, so a
-// legitimately sparse real classification from the LLM itself doesn't
-// get re-tried forever).
+// Finds rows with <= THIN_TAG_THRESHOLD tags, EXCLUDING any row whose
+// source marks it as already-curated (see CURATED_SOURCE_PREFIXES and the
+// Entry 83/84 header note -- manual_seed_v3 rows are frequently
+// intentionally thin because no honest tag match exists, not because
+// they're low-quality, and re-rolling them was silently overwriting
+// verified data). Re-classifies each remaining candidate via the real
+// pipeline, and OVERWRITES only if the new result is a genuine
+// improvement -- see isImprovement() below for the updated (Entry 83/84)
+// definition, which no longer treats "more tags" alone as sufficient.
 async function runReclassifyThin(limit: number) {
   const [tagNames, genreNames] = await Promise.all([getTagVocabNames(), getGenreVocabNames()]);
 
@@ -400,7 +473,8 @@ async function runReclassifyThin(limit: number) {
   if (fetchErr) throw fetchErr;
 
   const thin = (candidates || []).filter(
-    (row: { tag_weights: Record<string, number> | null }) =>
+    (row: { tag_weights: Record<string, number> | null; source: string | null }) =>
+      !isCuratedSource(row.source) &&
       Object.keys(row.tag_weights || {}).length <= THIN_TAG_THRESHOLD
   );
 
@@ -424,13 +498,7 @@ async function runReclassifyThin(limit: number) {
       continue;
     }
 
-    const oldTagCount = Object.keys(row.tag_weights || {}).length;
-    const oldGenreCount = Object.keys(row.genre_weights || {}).length;
-    const newTagCount = Object.keys(result.tagWeights).length;
-    const newGenreCount = Object.keys(result.genreWeights).length;
-    const isImprovement = newTagCount > oldTagCount || (newTagCount === oldTagCount && newGenreCount > oldGenreCount);
-
-    if (!isImprovement) {
+    if (!isImprovement(row.tag_weights, row.genre_weights, result.tagWeights, result.genreWeights)) {
       noImprovement++;
       await sleep(LLM_CALL_GAP_MS);
       continue;
@@ -463,6 +531,41 @@ async function runReclassifyThin(limit: number) {
     noImprovement,
     noSignal
   };
+}
+
+// Entry 83/84: "improvement" used to mean strictly-more tags (or equal
+// tags with more genres) -- a pure count comparison with no check on
+// whether the new result actually kept what the old one got right. That
+// let a reclassification DROP a high-confidence, precise tag in exchange
+// for more numerous but vaguer ones and still count as "better" purely
+// on count. Fixed definition: still requires more tags (or equal tags +
+// more genres) as before, but now ALSO requires that any old tag with
+// weight >= HIGH_CONFIDENCE_TAG_WEIGHT survives into the new tag set --
+// if the new classification would silently drop a tag the old one was
+// highly confident about, that's treated as a regression, not an
+// improvement, no matter how many other tags it adds.
+function isImprovement(
+  oldTagWeights: Record<string, number> | null,
+  oldGenreWeights: Record<string, number> | null,
+  newTagWeights: Record<string, number>,
+  newGenreWeights: Record<string, number>
+) {
+  const oldTags = oldTagWeights || {};
+  const oldGenres = oldGenreWeights || {};
+  const oldTagCount = Object.keys(oldTags).length;
+  const oldGenreCount = Object.keys(oldGenres).length;
+  const newTagCount = Object.keys(newTagWeights).length;
+  const newGenreCount = Object.keys(newGenreWeights).length;
+
+  const moreOverall = newTagCount > oldTagCount || (newTagCount === oldTagCount && newGenreCount > oldGenreCount);
+  if (!moreOverall) return false;
+
+  const droppedHighConfidenceTag = Object.entries(oldTags).some(
+    ([tagName, weight]) => weight >= HIGH_CONFIDENCE_TAG_WEIGHT && !(tagName in newTagWeights)
+  );
+  if (droppedHighConfidenceTag) return false;
+
+  return true;
 }
 
 // ---- Entry point ----
