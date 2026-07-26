@@ -512,7 +512,8 @@ function rankResults(results, { classifierRanked, moodAggregate, queryTokens, qu
   // How much of the intent budget semantic similarity claims this batch —
   // flat MAX_SEMANTIC_WEIGHT when semanticEnabled, 0 otherwise. Computed
   // once per batch, same as qualityWeight above.
-  const semanticWeight = semanticEnabled ? MAX_SEMANTIC_WEIGHT : 0;
+  const hasAnySemanticScore = partial.some((p) => typeof p.candidate.semanticScore === 'number');
+const semanticWeight = (semanticEnabled && hasAnySemanticScore) ? MAX_SEMANTIC_WEIGHT : 0;
   const remainingWeight = 1 - qualityWeight - semanticWeight;
 
   const scored = partial.map(({ candidate, textMatch, genreMatch, emotionMatch, popularity, quality }) => {
