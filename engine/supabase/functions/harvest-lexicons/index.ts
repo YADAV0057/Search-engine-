@@ -4,7 +4,7 @@
 // ==========================================
 // POST /harvest-lexicons   (header: x-harvest-secret: <HARVEST_SECRET>)
 // { "entityTypes": ["genre","tag","staff","character","studio","media","media_mangadex","synonym"] }  (optional, default: all)
-// -> { "results": { "genre": { loaded: n }, "staff": { loaded: n, maxId: n }, ..., "synonym": { loaded: n, seeds: n } } }
+// -> { "results": { "genre": { loaded: n }, "staff": { loaded: n, maxId: n }, ..., "synonym": { loaded: n, seeds: n } }, "errors"?: {...} }
 //
 // NOT part of the live /search request path — same reasoning the old
 // engine used to drop shikimoriClient.js (README section 4): this is an
@@ -79,6 +79,36 @@
 // comfortably inside one run) so it doesn't need this, but it does log
 // progress per seed so a killed run's partial upserts are still visible
 // in partialResults.
+//
+// FIX 2026-07-26: previously the ENTIRE entry point (genre/tag ->
+// staff/character/studio/media -> media_mangadex -> synonym) ran inside
+// ONE try/catch. Any exception anywhere in that chain — most commonly
+// AniList 429ing on `character` right after a `staff` pass (see
+// ENTITY_TYPE_COOLDOWN_MS's own header note; the existing 12s cooldown
+// has been observed to NOT always be enough headroom) — aborted the
+// whole request immediately, which meant media_mangadex and synonym were
+// silently never even attempted, every single run, despite having zero
+// technical dependency on AniList succeeding. Confirmed via
+// lexicon_sync_state directly: media:mangadex's last successful sync sat
+// unchanged for ~12 days while harvest-lexicons kept running on its
+// 6-hour schedule the whole time, purely because it kept dying earlier
+// in the same request on the AniList side.
+// Fixed by giving each independent section (static genre/tag, the AniList
+// staff/character/studio/media loop, media_mangadex, synonym) its own
+// try/catch. A failure in one is recorded in the new `errors` field and
+// the run continues to the next section instead of aborting. The AniList
+// loop itself still stops at the first failing entity type within that
+// loop (retrying character/studio/media after staff just failed would
+// likely 429 again immediately), but that no longer prevents
+// media_mangadex/synonym from running in the same invocation.
+// Response shape change: on any partial failure, status is now 207
+// (Multi-Status) instead of 500, `results` holds whatever DID succeed,
+// and a new `errors` field (keyed by section name) holds messages for
+// whatever didn't. A run where everything succeeds is unchanged: 200,
+// `results` only, no `errors` key. This is a response-shape change for
+// the partial-failure case specifically — worth a heads-up to anything
+// parsing this function's output (e.g. the GitHub Actions workflow's own
+// log lines) if it currently branches only on exactly 200 vs 500.
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 
@@ -114,7 +144,17 @@ const MAX_PAGES_PER_RUN = 200; // hard ceiling (10k rows/entity/run) so a bad sy
 // request, in isolation, right after a staff run). REQUEST_GAP_MS alone
 // (previously used here) isn't enough separation between a whole entity
 // type's worth of traffic and the next one's first request.
-const ENTITY_TYPE_COOLDOWN_MS = 12000;
+//
+// STILL NOT ENOUGH as of 2026-07-26: live runs are still hitting a 429 on
+// `character` immediately after `staff`, even with this 12s cooldown in
+// place — bumped to 20s as a first mitigation alongside today's
+// try/catch-per-section fix. Flagging that this may need to go higher
+// still, or that something outside this function's own pacing (e.g.
+// concurrent AniList calls from the live search path — see
+// domains.js's referenceTitle/recommendations lookups) is sharing the
+// same rate-limit window. Worth checking AniList request volume from
+// other sources around the same time before tuning this further.
+const ENTITY_TYPE_COOLDOWN_MS = 20000;
 
 // Datamuse: 100k requests/day, no key, no documented per-second limit, but
 // stay polite and predictable — same gap as AniList rather than hammering
@@ -759,48 +799,79 @@ Deno.serve(async (req) => {
     : ALL_ENTITY_TYPES;
 
   const results = {};
+  const errors = {};
 
-  try {
-    if (requested.includes('genre') || requested.includes('tag')) {
+  // FIX 2026-07-26 (see the top-of-file changelog entry for the full
+  // incident writeup): each section below now has its OWN try/catch,
+  // instead of one try/catch wrapping the entire function. Previously an
+  // AniList failure partway through staff/character/studio/media aborted
+  // the whole request, silently skipping media_mangadex/synonym every
+  // time even though neither depends on AniList at all. Now a failure in
+  // one section is recorded in `errors` and the run continues to the
+  // next independent section.
+
+  // -- Section 1: static genre/tag/theme/demographic (AniList) --
+  if (requested.includes('genre') || requested.includes('tag')) {
+    try {
       Object.assign(results, await harvestStatic());
       await sleep(REQUEST_GAP_MS);
+    } catch (err) {
+      console.error('[harvest-lexicons] static (genre/tag/theme/demographic) harvest failed', err);
+      errors.static = err?.message ?? String(err);
     }
+  }
 
-    for (const entityType of ['staff', 'character', 'studio', 'media']) {
-      if (!requested.includes(entityType)) continue;
+  // -- Section 2: paginated AniList entities (staff -> character -> studio -> media) --
+  // Stops at the first failing entity type within this loop (retrying the
+  // next AniList entity type immediately after a failure here would very
+  // likely just 429 again too) — but a failure here no longer prevents
+  // Section 3/4 below from running, which is the actual fix.
+  for (const entityType of ['staff', 'character', 'studio', 'media']) {
+    if (!requested.includes(entityType)) continue;
+    try {
       results[entityType] = await harvestPaginated(entityType);
-      // UPDATED 2026-07-19: was REQUEST_GAP_MS (750ms/1000ms) — not enough
-      // separation between one entity type's full pagination run and the
-      // next type's first request. See ENTITY_TYPE_COOLDOWN_MS above.
       await sleep(ENTITY_TYPE_COOLDOWN_MS);
+    } catch (err) {
+      console.error(`[harvest-lexicons] ${entityType} harvest failed`, err);
+      errors[entityType] = err?.message ?? String(err);
+      break;
     }
+  }
 
-    // Independent second media source — see harvestMediaFromMangaDex()
-    // decision log above. Kept as its own opt-in entity type rather than
-    // folded into the 'media' loop above so it can be triggered on its
-    // own (e.g. via the GitHub Actions workflow_dispatch input) without
-    // re-touching AniList at all.
-    if (requested.includes('media_mangadex')) {
+  // -- Section 3: MangaDex media (manga titles), independent of AniList entirely --
+  // Now guaranteed to run even if Section 2 above failed, since MangaDex
+  // has its own separate rate limit and its own separate sync-state
+  // cursor — there was never a real dependency on AniList succeeding
+  // first, only an accidental one from sharing a try/catch.
+  if (requested.includes('media_mangadex')) {
+    try {
       results.media_mangadex = await harvestMediaFromMangaDex();
       await sleep(REQUEST_GAP_MS);
+    } catch (err) {
+      console.error('[harvest-lexicons] media_mangadex harvest failed', err);
+      errors.media_mangadex = err?.message ?? String(err);
     }
-
-    // Runs last, deliberately: depends on genre/tag/theme/demographic rows
-    // already being in lexicon_entities, which either came from this same
-    // run's harvestStatic() call above, or a prior run.
-    if (requested.includes('synonym')) {
-      results.synonym = await harvestSynonyms();
-    }
-
-    return json({ results }, 200);
-  } catch (err) {
-    // FIXED 2026-07-13: previously returned only a generic "Harvest
-    // failed" string, swallowing the real error and forcing guesswork on
-    // every failure (see the 429 investigation in the project log). Now
-    // surfaces err.message alongside partialResults.
-    console.error('[harvest-lexicons] failed', err);
-    return json({ error: 'Harvest failed', message: err?.message ?? String(err), partialResults: results }, 500);
   }
+
+  // -- Section 4: synonyms (Datamuse), depends only on genre/tag/theme/demographic rows --
+  // already being in lexicon_entities (this run's Section 1, or a prior
+  // run's) — not on Section 2/3 succeeding.
+  if (requested.includes('synonym')) {
+    try {
+      results.synonym = await harvestSynonyms();
+    } catch (err) {
+      console.error('[harvest-lexicons] synonym harvest failed', err);
+      errors.synonym = err?.message ?? String(err);
+    }
+  }
+
+  const hasErrors = Object.keys(errors).length > 0;
+  // 207 Multi-Status: some section(s) failed, others succeeded — distinct
+  // from the old behavior of a bare 500 that told you nothing succeeded,
+  // which was no longer true once sections became independent. A run
+  // where every requested section succeeds is byte-identical to before:
+  // 200, `results` only, no `errors` key.
+  return json(hasErrors ? { results, errors } : { results }, hasErrors ? 207 : 200);
 });
 
 function json(body, status) {
