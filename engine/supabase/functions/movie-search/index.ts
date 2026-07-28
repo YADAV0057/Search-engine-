@@ -1,5 +1,5 @@
 // engine/supabase/functions/movie-search/index.ts
-//
+// 
 // Movie search endpoint. Stage 1 of the build sequencing in
 // Movie Search — Architecture & UX Plan (2026-07-28): waterfall + filters
 // skeleton. Mood/keyword-signature matching and embeddings are stubbed
