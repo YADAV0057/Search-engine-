@@ -1,4 +1,4 @@
-// engine/supabase/functions/movie-search/adapters/trakt.ts
+// engine/supabase/functions/movie-search/adapters/trakt.ts 
 //
 // Trakt adapter — optional last-resort fallback, used only if both TMDB and
 // OMDb fail. Trakt's free API requires the trakt-api-version and
