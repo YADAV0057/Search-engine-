@@ -3,7 +3,7 @@
 // OMDb adapter — fallback catalog source, used only when TMDB fails entirely
 // (network error, 5xx, or exhausted retries). OMDb has no discover/filter
 // endpoint, so this only supports title-text search, not language/provider/genre
-// filtering — those filters are simply not applied when the waterfall falls
+// filtering — those filters are simply not applied when the waterfall falls 
 // back this far.
 
 const OMDB_BASE = "https://www.omdbapi.com/";
