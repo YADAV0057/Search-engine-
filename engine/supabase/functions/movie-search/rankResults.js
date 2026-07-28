@@ -1,5 +1,5 @@
 // engine/supabase/functions/movie-search/rankResults.js
-//
+// 
 // Movie-specific ranker. Deliberately NOT shared with manga's rankResults.js —
 // see Movie Search — Architecture & UX Plan (2026-07-28). Signal set is
 // movie-native: popularity/vote signal, language match, provider match,
