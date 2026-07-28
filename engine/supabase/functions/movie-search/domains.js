@@ -1,4 +1,4 @@
-// engine/supabase/functions/movie-search/domains.js
+// engine/supabase/functions/movie-search/domains.js 
 //
 // Movie-specific query planning. Deliberately NOT shared with manga's domains.js —
 // see Movie Search — Architecture & UX Plan (2026-07-28) for why. This is Stage 1
