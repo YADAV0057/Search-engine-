@@ -6,7 +6,7 @@
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const MAX_RETRIES = 3;
-const BASE_BACKOFF_MS = 400;
+const BASE_BACKOFF_MS = 400; 
 
 function apiKey(): string {
   const key = Deno.env.get("TMDB_API_KEY");
