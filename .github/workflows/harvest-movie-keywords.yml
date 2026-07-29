@@ -1,0 +1,63 @@
+name: Harvest Movie Keywords (backup cron)
+
+# BACKUP trigger for the harvest-movie-keywords Edge Function (Notion Entry
+# 101). Deliberately a SEPARATE trigger path from whatever's driving
+# harvest-movies' own cron (that one runs via Supabase's own scheduler, per
+# Entry 99) — the point of a "backup" is that it can't fail for the same
+# reason the primary does. If Supabase's scheduler stalls, gets
+# misconfigured, or the project's cron config gets wiped, this still fires
+# independently from GitHub's infrastructure.
+#
+# Every 6 hours — same cadence reasoning harvest-tropes/index.ts's own
+# header comments use for its own manual/cron runs ("same 6-hour cron as
+# harvest-lexicons"). Loose on purpose: this is a backup path, not the
+# primary driver, and the function's own skippedExisting logic makes
+# redundant/overlapping runs harmless (already-seeded terms are skipped,
+# not reprocessed) — so there's no real cost to erring toward "runs a bit
+# more than strictly needed."
+#
+# REQUIRED SETUP before this workflow will do anything:
+#   Repo Settings -> Secrets and variables -> Actions -> New repository
+#   secret named HARVEST_SECRET, value = the same HARVEST_SECRET already
+#   set in Supabase's Edge Function Secrets (reused, not a new value —
+#   see harvest-movie-keywords/index.ts's own header note on this).
+#
+# Runs mode "bootstrap" against the 40-term starter list (see
+# harvest-movie-keywords/index.ts's STARTER_MOOD_TERMS) — once every term
+# in that list has been seeded, later runs will just report
+# skippedExisting: 40, checked: 0-25 depending on limit, and do nothing
+# further. That's expected, not a failure — this list only grows if/when
+# someone adds more starter terms to the function itself, or the planned
+# query-time fallback (flagged as a real gap in Entry 101) gets built.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # every 6 hours, UTC
+  workflow_dispatch:         # lets you trigger it manually from the Actions tab too
+
+jobs:
+  harvest-movie-keywords:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call harvest-movie-keywords
+        run: |
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://uvperhzhnosjtkwxxnte.supabase.co/functions/v1/harvest-movie-keywords" \
+            -H "x-harvest-secret: ${{ secrets.HARVEST_SECRET }}" \
+            -H "Content-Type: application/json" \
+            -d '{"mode":"bootstrap","limit":25}')
+
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+
+          echo "HTTP status: $http_code"
+          echo "Response body: $body"
+
+          # Fail the workflow run (so it shows red in the Actions tab and
+          # can notify) on anything other than 200 — a 401 almost always
+          # means HARVEST_SECRET isn't set correctly in repo secrets yet,
+          # worth surfacing loudly rather than silently no-op'ing forever.
+          if [ "$http_code" -ne 200 ]; then
+            echo "::error::harvest-movie-keywords returned HTTP $http_code"
+            exit 1
+          fi
