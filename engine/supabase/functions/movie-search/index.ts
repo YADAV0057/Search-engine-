@@ -1,15 +1,22 @@
 // engine/supabase/functions/movie-search/index.ts
-// 
-// Movie search endpoint. Stage 1 of the build sequencing in
-// Movie Search — Architecture & UX Plan (2026-07-28): waterfall + filters
-// skeleton. Mood/keyword-signature matching and embeddings are stubbed
-// (see domains.js's `keywordSignature: null` and rankResults.js's
-// hasAnySemanticScore gate) and get filled in during Stage 2/3.
+//
+// Movie search endpoint.
+//
+// STAGE 2 (2026-07-31): keyword-signature (mood) matching wired in — see
+// domains.js and rankResults.js header comments for the full writeup. Two
+// changes needed here specifically:
+//   1. A supabase client now exists (same createClient pattern as manga's
+//      search/index.ts) and gets passed into parseMovieQuery, which is now
+//      async because it queries movie_keyword_signatures.
+//   2. normalizeTmdbMovie keeps `genre_ids` (previously dropped) so
+//      rankResults.js's moodMatchScore has something to compare the
+//      keyword-signature's genre_weights against.
 //
 // Fully separate from engine/supabase/functions/search/ (manga) — own
 // ranker, own query planner, own tables (movie_entities / movie_sync_state,
 // not touched by this file directly). See the architecture doc for why.
 
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { parseMovieQuery } from "./domains.js";
 import { rankMovies } from "./rankResults.js";
 import * as tmdb from "./adapters/tmdb.ts";
@@ -23,6 +30,11 @@ const CORS_HEADERS = {
 };
 
 const DEFAULT_WATCH_REGION = "IN"; // MoodManga's primary audience; overridden per-request when provided
+
+const supabase = createClient(
+  Deno.env.get("SUPABASE_URL")!,
+  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+);
 
 interface MovieSearchRequest {
   query?: string;
@@ -45,6 +57,10 @@ function normalizeTmdbMovie(m: tmdb.TmdbMovie) {
     overview: m.overview,
     release_date: m.release_date,
     original_language: m.original_language,
+    // Kept as of Stage 2 — rankResults.js's moodMatchScore reads this to
+    // compare against the query's keyword-signature genre_weights. Was
+    // previously dropped here since nothing consumed it yet.
+    genre_ids: m.genre_ids ?? [],
     vote_average: m.vote_average,
     vote_count: m.vote_count,
     popularity: m.popularity,
@@ -74,7 +90,7 @@ async function attachWatchProviders(movies: ReturnType<typeof normalizeTmdbMovie
   );
 }
 
-async function runWaterfall(intent: ReturnType<typeof parseMovieQuery>) {
+async function runWaterfall(intent: Awaited<ReturnType<typeof parseMovieQuery>>) {
   // Tier 1: TMDB (primary) — covers search, discover, language + provider + genre filters.
   try {
     const results = await tmdb.discoverMovies({
@@ -122,7 +138,7 @@ Deno.serve(async (req) => {
 
   try {
     const body: MovieSearchRequest = req.method === "POST" ? await req.json() : {};
-    const intent = parseMovieQuery(body);
+    const intent = await parseMovieQuery(body, supabase);
 
     const { movies, tier } = await runWaterfall(intent);
     const ranked = rankMovies(movies, intent);
@@ -135,6 +151,7 @@ Deno.serve(async (req) => {
           count: ranked.length,
           watchRegion: intent.watchRegion ?? DEFAULT_WATCH_REGION,
           exclusions: intent.exclusions,
+          keywordSignature: intent.keywordSignature,
         },
       }),
       { headers: { ...CORS_HEADERS, "Content-Type": "application/json" } },
