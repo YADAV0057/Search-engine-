@@ -91,4 +91,3 @@ export async function searchMovies(searchText: string, page = 1): Promise<Normal
       source: "omdb" as const,
     }));
 }
-
