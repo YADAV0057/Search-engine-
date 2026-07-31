@@ -149,4 +149,3 @@ export async function getWatchProviders(
 export async function getMovieDetails(movieId: number): Promise<any> {
   return await tmdbFetch(`/movie/${movieId}`, { append_to_response: "credits" });
 }
-
