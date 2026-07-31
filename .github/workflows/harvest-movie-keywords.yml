@@ -31,8 +31,7 @@ name: Harvest Movie Keywords (backup cron)
 # query-time fallback (flagged as a real gap in Entry 101) gets built.
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'   # every 6 hours, UTC
+  
   workflow_dispatch:         # lets you trigger it manually from the Actions tab too
 
 jobs:
