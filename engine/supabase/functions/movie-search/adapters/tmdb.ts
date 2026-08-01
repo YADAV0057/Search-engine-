@@ -91,7 +91,8 @@ export async function discoverMovies(params: MovieDiscoverParams): Promise<TmdbM
     ? await tmdbFetch("/search/movie", {
         query: params.searchText,
         page,
-        // /search/movie ignores with_original_language, so we filter client-side below.
+        // /search/movie ignores with_original_language. We intentionally do NOT
+        // filter client-side here — see note below.
       })
     : await tmdbFetch("/discover/movie", {
         with_original_language: params.language,
@@ -102,14 +103,21 @@ export async function discoverMovies(params: MovieDiscoverParams): Promise<TmdbM
         page,
       });
 
-  let results: TmdbMovie[] = data.results ?? [];
+  const results: TmdbMovie[] = data.results ?? [];
 
-  // /search/movie has no language filter param, so apply it manually when both
-  // a free-text query and a language filter were given together.
-  if (params.searchText && params.language) {
-    results = results.filter((m) => m.original_language === params.language);
-  }
-
+  // Previously this hard-filtered out any result whose original_language
+  // didn't match params.language when both a free-text query and a language
+  // filter were given together. That's wrong for a market where dubbed
+  // content is the norm: a movie like Baahubali is tagged original_language
+  // "te" (Telugu) in TMDB, so searching "Bahubali" + language=hi returned
+  // zero results even though the Hindi dub is what most users mean.
+  //
+  // Language filtering for /search/movie is now handled entirely downstream
+  // by rankResults.js's languageMatchScore, as a soft ranking signal (movies
+  // matching the requested language rank higher) rather than a hard exclude.
+  // /discover/movie (the no-searchText branch above) still applies
+  // with_original_language server-side as a real filter, since that's a
+  // deliberate "browse this language" flow, not a title search.
   return results;
 }
 
