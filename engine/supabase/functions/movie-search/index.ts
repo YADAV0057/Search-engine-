@@ -12,6 +12,19 @@
 //      rankResults.js's moodMatchScore has something to compare the
 //      keyword-signature's genre_weights against.
 //
+// STAGE 3 (2026-08-01): on-demand embedding. Previously a movie only ever
+// got an embedding via the backfill-movie-embeddings cron sweeping
+// movie_entities in id order — meaning a title a user actually searched for
+// today could sit unembedded for weeks depending on where it falls in that
+// sweep. Now, after every TMDB-tier search, any result missing an embedding
+// gets embedded and upserted into movie_entities via embedOnDemand.ts,
+// fired through EdgeRuntime.waitUntil() so it runs AFTER the response has
+// already gone out — it costs nothing in search latency, it just means the
+// row is ready by the next time anyone (or the ranker's semantic signal,
+// once wired) needs it. Requires GEMINI_API_KEY2 (and ideally
+// GEMINI_API_KEY3) to be set as secrets on this function too, same as
+// backfill-movie-embeddings.
+//
 // Fully separate from engine/supabase/functions/search/ (manga) — own
 // ranker, own query planner, own tables (movie_entities / movie_sync_state,
 // not touched by this file directly). See the architecture doc for why.
@@ -19,6 +32,7 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { parseMovieQuery } from "./domains.js";
 import { rankMovies } from "./rankResults.js";
+import { embedMissingMovies } from "./embedOnDemand.ts";
 import * as tmdb from "./adapters/tmdb.ts";
 import * as omdb from "./adapters/omdb.ts";
 import * as trakt from "./adapters/trakt.ts";
@@ -142,6 +156,26 @@ Deno.serve(async (req) => {
 
     const { movies, tier } = await runWaterfall(intent);
     const ranked = rankMovies(movies, intent);
+
+    // Stage 3: on-demand embedding, TMDB tier only — OMDb/Trakt fallback
+    // results don't carry a tmdbId or genre_ids, so there's nothing to key
+    // an upsert into movie_entities on. Fired via waitUntil so it runs
+    // AFTER the response below is returned; adds zero latency to this request.
+    if (tier === "tmdb" && ranked.length > 0) {
+      const candidates = ranked
+        .filter((m): m is typeof m & { tmdbId: number } => typeof (m as any).tmdbId === "number")
+        .map((m) => ({
+          tmdbId: (m as any).tmdbId,
+          title: (m as any).title,
+          overview: (m as any).overview,
+          release_date: (m as any).release_date,
+          genre_ids: (m as any).genre_ids,
+        }));
+
+      // @ts-ignore — EdgeRuntime is a Supabase/Deno Deploy global, not in
+      // the standard Deno types.
+      EdgeRuntime.waitUntil(embedMissingMovies(candidates, supabase));
+    }
 
     return new Response(
       JSON.stringify({
