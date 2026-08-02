@@ -1,33 +1,31 @@
 // engine/supabase/functions/movie-search/index.ts
 //
-// Movie search endpoint.
+// Movie + TV search endpoint.
 //
-// STAGE 2 (2026-07-31): keyword-signature (mood) matching wired in — see
-// domains.js and rankResults.js header comments for the full writeup. Two
-// changes needed here specifically:
-//   1. A supabase client now exists (same createClient pattern as manga's
-//      search/index.ts) and gets passed into parseMovieQuery, which is now
-//      async because it queries movie_keyword_signatures.
-//   2. normalizeTmdbMovie keeps `genre_ids` (previously dropped) so
-//      rankResults.js's moodMatchScore has something to compare the
-//      keyword-signature's genre_weights against.
+// TV SUPPORT (2026-08-01): request body now accepts `mediaType: "movie" |
+// "tv"` (defaults to "movie" — fully back-compatible). TV shares this
+// function rather than getting its own since the pipeline shape is
+// identical; only TMDB endpoints, field names (name/first_air_date vs
+// title/release_date), and genre id map differ, handled via mediaType
+// branches below and in domains.js/tmdb.ts. OMDb/Trakt fallback tiers are
+// movie-only — a TV request that fails at the TMDB tier returns an error
+// rather than waterfalling.
 //
-// STAGE 3 (2026-08-01): on-demand embedding. Previously a movie only ever
-// got an embedding via the backfill-movie-embeddings cron sweeping
-// movie_entities in id order — meaning a title a user actually searched for
-// today could sit unembedded for weeks depending on where it falls in that
-// sweep. Now, after every TMDB-tier search, any result missing an embedding
-// gets embedded and upserted into movie_entities via embedOnDemand.ts,
-// fired through EdgeRuntime.waitUntil() so it runs AFTER the response has
-// already gone out — it costs nothing in search latency, it just means the
-// row is ready by the next time anyone (or the ranker's semantic signal,
-// once wired) needs it. Requires GEMINI_API_KEY2 (and ideally
-// GEMINI_API_KEY3) to be set as secrets on this function too, same as
-// backfill-movie-embeddings.
+// ANIME FILTER (2026-08-02): TV requests now accept `excludeAnime: boolean`.
+// TMDB has no standalone "Anime" genre — anime shows are tagged Animation
+// (16) same as Western cartoons, distinguishable only by
+// original_language === "ja". That's the same heuristic most TMDB-based
+// apps use (imperfect — it'll also catch a handful of non-anime Japanese
+// animated content, and won't catch anime co-productions not tagged "ja" —
+// but it's the standard approach given what TMDB actually exposes).
+// Filtering happens BEFORE ranking, on the raw TMDB page, so pagination's
+// hasMore still reflects whether TMDB itself had another page — otherwise
+// a heavily-anime page (e.g. an Animation-genre browse) could filter down
+// to a handful of results while meta still claimed "no more pages" because
+// the post-filter count came in under TMDB_PAGE_SIZE.
 //
 // Fully separate from engine/supabase/functions/search/ (manga) — own
-// ranker, own query planner, own tables (movie_entities / movie_sync_state,
-// not touched by this file directly). See the architecture doc for why.
+// ranker, own query planner, own tables (movie_entities / movie_sync_state).
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { parseMovieQuery } from "./domains.js";
@@ -43,7 +41,9 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-const DEFAULT_WATCH_REGION = "IN"; // MoodManga's primary audience; overridden per-request when provided
+const DEFAULT_WATCH_REGION = "IN";
+const TMDB_PAGE_SIZE = 20; // TMDB's fixed page size for /search and /discover
+const ANIME_GENRE_ID = 16; // TMDB's "Animation" — see header note, no dedicated Anime genre exists
 
 const supabase = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -52,15 +52,15 @@ const supabase = createClient(
 
 interface MovieSearchRequest {
   query?: string;
+  mediaType?: "movie" | "tv";
   language?: string;
   watchProviders?: string;
   watchRegion?: string;
   genres?: string;
   page?: number;
+  excludeAnime?: boolean;
 }
 
-// Top N provider logos surfaced directly on the card, per the UX plan's
-// "cap to top 4-5 logos by display_priority" decision.
 const MAX_CARD_PROVIDERS = 5;
 
 function normalizeTmdbMovie(m: tmdb.TmdbMovie) {
@@ -71,9 +71,6 @@ function normalizeTmdbMovie(m: tmdb.TmdbMovie) {
     overview: m.overview,
     release_date: m.release_date,
     original_language: m.original_language,
-    // Kept as of Stage 2 — rankResults.js's moodMatchScore reads this to
-    // compare against the query's keyword-signature genre_weights. Was
-    // previously dropped here since nothing consumed it yet.
     genre_ids: m.genre_ids ?? [],
     vote_average: m.vote_average,
     vote_count: m.vote_count,
@@ -81,31 +78,84 @@ function normalizeTmdbMovie(m: tmdb.TmdbMovie) {
     poster_path: m.poster_path,
     backdrop_path: m.backdrop_path,
     source: "tmdb" as const,
+    mediaType: "movie" as const,
   };
 }
 
-// Attaches a capped, display_priority-sorted provider list to each TMDB
-// result. Only runs for the TMDB path — OMDb/Trakt fallback results ship
-// without "where to watch" data, since neither API exposes it on the free tier.
-async function attachWatchProviders(movies: ReturnType<typeof normalizeTmdbMovie>[], watchRegion: string) {
+// TV's TMDB shape uses name/first_air_date instead of title/release_date —
+// normalized into the exact same output shape as normalizeTmdbMovie so
+// rankResults.js and the frontend never need to branch on mediaType.
+function normalizeTmdbTv(m: tmdb.TmdbTv) {
+  return {
+    id: `tmdb-tv-${m.id}`,
+    tmdbId: m.id,
+    title: m.name,
+    overview: m.overview,
+    release_date: m.first_air_date,
+    original_language: m.original_language,
+    genre_ids: m.genre_ids ?? [],
+    vote_average: m.vote_average,
+    vote_count: m.vote_count,
+    popularity: m.popularity,
+    poster_path: m.poster_path,
+    backdrop_path: m.backdrop_path,
+    source: "tmdb" as const,
+    mediaType: "tv" as const,
+  };
+}
+
+// See ANIME_GENRE_ID header note — applied to raw TMDB items (both movie's
+// TmdbMovie and TV's TmdbTv shapes carry genre_ids + original_language
+// already, pre-normalization).
+function isAnime(item: { genre_ids?: number[]; original_language?: string }): boolean {
+  return item.original_language === "ja" && (item.genre_ids ?? []).includes(ANIME_GENRE_ID);
+}
+
+async function attachWatchProviders(
+  items: ReturnType<typeof normalizeTmdbMovie>[],
+  mediaType: tmdb.MediaType,
+  watchRegion: string,
+) {
   return await Promise.all(
-    movies.map(async (movie) => {
+    items.map(async (item) => {
       try {
-        const providers = await tmdb.getWatchProviders(movie.tmdbId, watchRegion);
+        const providers = await tmdb.getWatchProviders(mediaType, item.tmdbId, watchRegion);
         const flatrate = (providers?.flatrate ?? [])
           .sort((a, b) => a.display_priority - b.display_priority)
           .slice(0, MAX_CARD_PROVIDERS);
-        return { ...movie, watchProviders: { ...providers, flatrate }, watchProvidersLink: providers?.link };
+        return { ...item, watchProviders: { ...providers, flatrate }, watchProvidersLink: providers?.link };
       } catch {
-        // A single title's provider lookup failing shouldn't sink the whole response.
-        return { ...movie, watchProviders: null };
+        return { ...item, watchProviders: null };
       }
     }),
   );
 }
 
 async function runWaterfall(intent: Awaited<ReturnType<typeof parseMovieQuery>>) {
-  // Tier 1: TMDB (primary) — covers search, discover, language + provider + genre filters.
+  if (intent.mediaType === "tv") {
+    // TV tier: TMDB only. OMDb/Trakt adapters are movie-search-only — no TV
+    // endpoint on either, so there's no fallback tier to waterfall to.
+    const rawResults = await tmdb.discoverTv({
+      searchText: intent.searchText,
+      language: intent.language,
+      watchProviders: intent.watchProviders,
+      watchRegion: intent.watchRegion ?? DEFAULT_WATCH_REGION,
+      genres: intent.genres,
+      page: intent.page,
+    });
+
+    // hasMore reflects the raw TMDB page, not the post-anime-filter count —
+    // see header note.
+    const hasMore = rawResults.length >= TMDB_PAGE_SIZE;
+
+    const filtered = intent.excludeAnime ? rawResults.filter((r) => !isAnime(r)) : rawResults;
+
+    const normalized = filtered.map(normalizeTmdbTv);
+    const withProviders = await attachWatchProviders(normalized, "tv", intent.watchRegion ?? DEFAULT_WATCH_REGION);
+    return { movies: withProviders, tier: "tmdb" as const, hasMore };
+  }
+
+  // Tier 1: TMDB (primary)
   try {
     const results = await tmdb.discoverMovies({
       searchText: intent.searchText,
@@ -115,30 +165,31 @@ async function runWaterfall(intent: Awaited<ReturnType<typeof parseMovieQuery>>)
       genres: intent.genres,
       page: intent.page,
     });
+    const hasMore = results.length >= TMDB_PAGE_SIZE;
     if (results.length > 0) {
-      const normalized = normalizeTmdbMovie ? results.map(normalizeTmdbMovie) : results;
-      const withProviders = await attachWatchProviders(normalized, intent.watchRegion ?? DEFAULT_WATCH_REGION);
-      return { movies: withProviders, tier: "tmdb" as const };
+      const normalized = results.map(normalizeTmdbMovie);
+      const withProviders = await attachWatchProviders(normalized, "movie", intent.watchRegion ?? DEFAULT_WATCH_REGION);
+      return { movies: withProviders, tier: "tmdb" as const, hasMore };
     }
     // Empty result set from TMDB is a legitimate "no matches," not a failure —
     // don't waterfall down just because zero results came back.
-    return { movies: [], tier: "tmdb" as const };
+    return { movies: [], tier: "tmdb" as const, hasMore: false };
   } catch (tmdbError) {
     console.error("[movie-search] TMDB tier failed, falling back to OMDb:", tmdbError);
   }
 
-  // Tier 2: OMDb (fallback) — title search only, no filter support.
+  // Tier 2: OMDb (fallback)
   try {
     const results = await omdb.searchMovies(intent.searchText ?? "", intent.page);
-    if (results.length > 0) return { movies: results, tier: "omdb" as const };
+    if (results.length > 0) return { movies: results, tier: "omdb" as const, hasMore: false };
   } catch (omdbError) {
     console.error("[movie-search] OMDb tier failed, falling back to Trakt:", omdbError);
   }
 
-  // Tier 3: Trakt (last resort) — title search only, no poster images on free tier.
+  // Tier 3: Trakt (last resort)
   try {
     const results = await trakt.searchMovies(intent.searchText ?? "", intent.page);
-    return { movies: results, tier: "trakt" as const };
+    return { movies: results, tier: "trakt" as const, hasMore: false };
   } catch (traktError) {
     console.error("[movie-search] Trakt tier failed — all providers exhausted:", traktError);
     throw new Error("All movie data providers are currently unavailable. Please try again shortly.");
@@ -153,14 +204,14 @@ Deno.serve(async (req) => {
   try {
     const body: MovieSearchRequest = req.method === "POST" ? await req.json() : {};
     const intent = await parseMovieQuery(body, supabase);
+    // excludeAnime is TV-only in practice (movie's own genre taxonomy has
+    // no equivalent ambiguity to resolve), but harmless to carry through
+    // parseMovieQuery's output regardless of mediaType.
+    (intent as any).excludeAnime = Boolean(body.excludeAnime);
 
-    const { movies, tier } = await runWaterfall(intent);
+    const { movies, tier, hasMore } = await runWaterfall(intent);
     const ranked = rankMovies(movies, intent);
 
-    // Stage 3: on-demand embedding, TMDB tier only — OMDb/Trakt fallback
-    // results don't carry a tmdbId or genre_ids, so there's nothing to key
-    // an upsert into movie_entities on. Fired via waitUntil so it runs
-    // AFTER the response below is returned; adds zero latency to this request.
     if (tier === "tmdb" && ranked.length > 0) {
       const candidates = ranked
         .filter((m): m is typeof m & { tmdbId: number } => typeof (m as any).tmdbId === "number")
@@ -172,17 +223,18 @@ Deno.serve(async (req) => {
           genre_ids: (m as any).genre_ids,
         }));
 
-      // @ts-ignore — EdgeRuntime is a Supabase/Deno Deploy global, not in
-      // the standard Deno types.
-      EdgeRuntime.waitUntil(embedMissingMovies(candidates, supabase));
+      // @ts-ignore — EdgeRuntime is a Supabase/Deno Deploy global.
+      EdgeRuntime.waitUntil(embedMissingMovies(candidates, supabase, intent.mediaType));
     }
 
     return new Response(
       JSON.stringify({
         results: ranked,
         meta: {
+          mediaType: intent.mediaType,
           tier,
           count: ranked.length,
+          hasMore,
           watchRegion: intent.watchRegion ?? DEFAULT_WATCH_REGION,
           exclusions: intent.exclusions,
           keywordSignature: intent.keywordSignature,
