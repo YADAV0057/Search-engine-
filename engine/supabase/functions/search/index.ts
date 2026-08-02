@@ -68,6 +68,7 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { buildCorsHeaders } from './cors.js';
 import { hashCacheKey, getCached, setCached } from './cache.js';
 import { DOMAINS } from './domains.js';
+import { embedMissingMedia } from './embedOnDemand.js';
 
 const supabase = createClient(
   Deno.env.get('SUPABASE_URL'),
@@ -142,10 +143,11 @@ Deno.serve(async (req) => {
     // explicitly documented in the Notion log — flagging this as my own
     // reasonable addition in case you want it removed to match exact
     // prior behavior.)
-    if (results && results.length > 0) {
-      await setCached(supabase, domain, cacheKey, results, handler.ttlSeconds);
-    }
-
+    
+if (results && results.length > 0) {
+  await setCached(supabase, domain, cacheKey, results, handler.ttlSeconds);
+  if (domain === 'manga') EdgeRuntime.waitUntil(embedMissingMedia(results, supabase));
+}
     return json(
       { results, cached: false, source, mood, page, hasMore, routing, classification, acclaim, referenceTitle, moodTags },
       200,
