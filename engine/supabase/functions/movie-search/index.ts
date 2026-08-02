@@ -24,6 +24,18 @@
 // to a handful of results while meta still claimed "no more pages" because
 // the post-filter count came in under TMDB_PAGE_SIZE.
 //
+// QUERY-TIME SEMANTIC SEARCH (Entry 107 Step 2, 2026-08-02): movie
+// free-text queries now also resolve against movie_entities' embeddings via
+// resolveSemanticCandidates() (new file), merged additively into whatever
+// the TMDB/OMDb/Trakt waterfall already returned. Movie-only — movie_entities
+// has no TV rows, so this is skipped entirely for mediaType: "tv" (also
+// fixes a pre-existing bug: the embedMissingMovies() trigger below used to
+// fire for TV results too despite embedOnDemand.ts being movie-only, which
+// would have upserted TV shows into movie_entities under entity_type:
+// "movie" the first time a TV search actually hit that code path — TV
+// search traffic hadn't exercised it yet, caught here via code review
+// rather than in production).
+//
 // Fully separate from engine/supabase/functions/search/ (manga) — own
 // ranker, own query planner, own tables (movie_entities / movie_sync_state).
 
@@ -31,6 +43,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { parseMovieQuery } from "./domains.js";
 import { rankMovies } from "./rankResults.js";
 import { embedMissingMovies } from "./embedOnDemand.ts";
+import { resolveSemanticCandidates } from "./resolveSemanticCandidates.ts";
 import * as tmdb from "./adapters/tmdb.ts";
 import * as omdb from "./adapters/omdb.ts";
 import * as trakt from "./adapters/trakt.ts";
@@ -196,6 +209,33 @@ async function runWaterfall(intent: Awaited<ReturnType<typeof parseMovieQuery>>)
   }
 }
 
+/**
+ * Merges query-time semantic candidates into the waterfall's own results.
+ * Movies already present get the semantic score attached (no duplicate
+ * card); movies the waterfall didn't surface but the embedding index did
+ * get appended as new candidates. Movie-only and free-text-only — see
+ * header note and resolveSemanticCandidates.ts's own doc comment.
+ */
+async function mergeSemanticCandidates(
+  movies: Array<Record<string, any>>,
+  intent: Awaited<ReturnType<typeof parseMovieQuery>>,
+) {
+  if (intent.mediaType !== "movie" || !intent.searchText) return movies;
+
+  const semanticCandidates = await resolveSemanticCandidates(intent.searchText, supabase);
+  if (!semanticCandidates.length) return movies;
+
+  const scoreByTmdbId = new Map(semanticCandidates.map((c) => [c.tmdbId, c.semanticScore]));
+  const existingIds = new Set(movies.map((m) => m.tmdbId));
+
+  const withScores = movies.map((m) =>
+    scoreByTmdbId.has(m.tmdbId) ? { ...m, semanticScore: scoreByTmdbId.get(m.tmdbId) } : m,
+  );
+  const newOnes = semanticCandidates.filter((c) => !existingIds.has(c.tmdbId));
+
+  return [...withScores, ...newOnes];
+}
+
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: CORS_HEADERS });
@@ -210,9 +250,13 @@ Deno.serve(async (req) => {
     (intent as any).excludeAnime = Boolean(body.excludeAnime);
 
     const { movies, tier, hasMore } = await runWaterfall(intent);
-    const ranked = rankMovies(movies, intent);
+    const mergedMovies = await mergeSemanticCandidates(movies, intent);
+    const ranked = rankMovies(mergedMovies, intent);
 
-    if (tier === "tmdb" && ranked.length > 0) {
+    // Movie-only guard (fix, see header note): embedMissingMovies() upserts
+    // into movie_entities under entity_type: "movie" unconditionally — it
+    // has no TV branch. Previously this fired for TV results too.
+    if (tier === "tmdb" && intent.mediaType === "movie" && ranked.length > 0) {
       const candidates = ranked
         .filter((m): m is typeof m & { tmdbId: number } => typeof (m as any).tmdbId === "number")
         .map((m) => ({
@@ -224,7 +268,7 @@ Deno.serve(async (req) => {
         }));
 
       // @ts-ignore — EdgeRuntime is a Supabase/Deno Deploy global.
-      EdgeRuntime.waitUntil(embedMissingMovies(candidates, supabase, intent.mediaType));
+      EdgeRuntime.waitUntil(embedMissingMovies(candidates, supabase));
     }
 
     return new Response(

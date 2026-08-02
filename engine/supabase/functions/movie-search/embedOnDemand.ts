@@ -23,6 +23,13 @@
 // Requires GEMINI_API_KEY2 (and ideally GEMINI_API_KEY3 as fallback) to be
 // set as Edge Function secrets on THIS function too — same env vars
 // backfill-movie-embeddings already uses, just also read here.
+//
+// UPDATE (Entry 107 Step 2, 2026-08-02): embedText() is now exported.
+// resolveSemanticCandidates.ts (new, query-time semantic search) reuses it
+// directly for embedding the search QUERY itself, so both the catalog side
+// (this file) and the query side use the identical key-fallback logic and
+// land in the same vector space — one implementation, not two copies of the
+// same two-key fallback rule.
 
 import type { SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
 import * as tmdb from "./adapters/tmdb.ts";
@@ -70,8 +77,10 @@ async function callGeminiEmbed(
 }
 
 // Same primary/fallback rule as backfill-movie-embeddings: key3 is only
-// used on a 429 from key2, not on other failure types.
-async function embedText(text: string): Promise<number[] | null> {
+// used on a 429 from key2, not on other failure types. Exported so
+// resolveSemanticCandidates.ts can embed a query with the identical logic
+// (see file header note above).
+export async function embedText(text: string): Promise<number[] | null> {
   if (!GEMINI_API_KEY2 && !GEMINI_API_KEY3) {
     console.error("[embedOnDemand] neither GEMINI_API_KEY2 nor GEMINI_API_KEY3 is set");
     return null;
