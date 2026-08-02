@@ -1,5 +1,5 @@
 // ==========================================
-// SEARCH — Edge Function entry point
+// SEARCH — Edge Function entry point 
 // supabase/functions/search/index.ts
 // ==========================================
 // POST /search
