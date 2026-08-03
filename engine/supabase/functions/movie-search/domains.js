@@ -12,6 +12,28 @@
 // matching in rankResults.js. Falls back to the old text-only behavior
 // (keywordSignature: null) if no signature rows match or supabase isn't passed.
 //
+// STAGE 3 (2026-08-02): fixes the bug where Stage 2's mood matching only ever
+// re-ranked a candidate pool that TMDB itself had already filtered down to
+// literal title/overview substring matches — because index.ts always called
+// tmdb.discoverMovies() with `searchText` set, which routes to TMDB's
+// /search/movie (literal text search) rather than /discover/movie (genre-based
+// discovery), regardless of whether a keyword signature matched. A query like
+// "sad movie" therefore only ever surfaced titles that literally contained the
+// word "sad" (e.g. "Sad Silent Movie") — real sad films without "sad" in the
+// title (Manchester by the Sea, The Fault in Our Stars, etc.) were never even
+// fetched, so no amount of re-ranking could surface them.
+//
+// Fix: detect when a query is a PURE mood expression — i.e. after stripping
+// noise words ("movie", "please", ...) and the matched keyword-signature
+// term(s) themselves, nothing distinguishing is left over (no title fragment,
+// actor name, plot description, etc.). Only in that case do we set
+// `moodOnlyQuery: true` and derive `discoverGenres` from the signature's
+// strongest-weighted genres. index.ts/tmdb.ts use these to route retrieval
+// through /discover/movie instead of /search/movie. A query that happens to
+// contain a seeded mood word AND other distinguishing text (e.g. "sad batman
+// movie") is left on the literal-search path exactly as before — this only
+// changes behavior for queries that are mood-only.
+//
 // Pattern borrowed from the manga pipeline (exclusion-term parsing, reference-title
 // detection) — not the code, per Entry 89/90's lesson.
 
@@ -78,10 +100,22 @@ function matchGenresInText(text) {
 // stopword list.
 const NOISE_WORDS = new Set(["movie", "movies", "film", "films", "a", "some", "please", "me", "show", "find"]);
 
+// Strips trailing/leading punctuation (straight/curly quotes, commas, etc.)
+// from a token before comparing it against NOISE_WORDS or a matched
+// signature term. Without this, a stray character appended by the frontend
+// (e.g. a query arriving as `sad movie"`) produces a token like `movie"`
+// that doesn't match the `movie` entry in NOISE_WORDS, silently defeating
+// the noise-word strip and, before this stage, defeating moodOnlyQuery
+// detection below too.
+function stripPunctuation(word) {
+  return word.replace(/^[\s"'“”‘’.,!?;:()]+|[\s"'“”‘’.,!?;:()]+$/g, "");
+}
+
 function candidateMoodTokens(cleanedQuery) {
   const words = cleanedQuery
     .toLowerCase()
     .split(/\s+/)
+    .map(stripPunctuation)
     .filter((w) => w && !NOISE_WORDS.has(w));
 
   // Both individual words and the full stripped phrase are candidates —
@@ -158,6 +192,41 @@ async function matchKeywordSignature(supabase, cleanedQuery) {
   }
 }
 
+// STAGE 3: true when, after stripping noise words and the matched
+// keyword-signature term(s) out of the cleaned query, nothing distinguishing
+// is left over. A leftover token (a title fragment, actor name, plot
+// description, additional untagged genre word, etc.) means the user wants
+// more than pure mood matching, so we leave retrieval on the literal
+// /search/movie path — this function only returns true for queries that are
+// mood expressions and nothing else.
+function isMoodOnlyQuery(cleanedQuery, matchedTerms) {
+  const matchedWords = new Set(
+    matchedTerms.flatMap((t) => t.toLowerCase().split(/\s+/).map(stripPunctuation)),
+  );
+
+  const leftover = cleanedQuery
+    .toLowerCase()
+    .split(/\s+/)
+    .map(stripPunctuation)
+    .filter((w) => w && !NOISE_WORDS.has(w) && !matchedWords.has(w));
+
+  return leftover.length === 0;
+}
+
+// STAGE 3: picks the genres to send to /discover/movie for a mood-only
+// query. Only genres at or above half the peak matched weight are used
+// (capped to the top 3), so a signature that boosts one dominant genre
+// (e.g. sad -> Drama 9, Romance 3) doesn't drag in a long tail of
+// weakly-related genres and dilute results.
+function pickDiscoverGenres(genreWeights) {
+  return Object.entries(genreWeights)
+    .filter(([, weight]) => weight >= 0.5)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 3)
+    .map(([id]) => id)
+    .join(",");
+}
+
 /**
  * Parses the incoming request into a structured search intent.
  *
@@ -173,6 +242,15 @@ async function matchKeywordSignature(supabase, cleanedQuery) {
  *   parseMovieQuery still works (minus mood matching) if ever called without it.
  */
 export async function parseMovieQuery(input, supabase) {
+  // TV SUPPORT FIX (2026-08-02): this was never being set, so
+  // intent.mediaType was always undefined regardless of what the request
+  // asked for. index.ts's runWaterfall() branches on
+  // `intent.mediaType === "tv"` to pick the TV-only TMDB tier — with this
+  // missing, every TV request silently ran the movie pipeline instead
+  // (wrong results, not even an error). Defaults to "movie", matching
+  // index.ts's own MovieSearchRequest.mediaType default per its header note.
+  const mediaType = input.mediaType === "tv" ? "tv" : "movie";
+
   const rawQuery = (input.query ?? "").trim();
   const { cleanedQuery, exclusions } = rawQuery ? extractExclusions(rawQuery) : { cleanedQuery: "", exclusions: [] };
 
@@ -181,17 +259,35 @@ export async function parseMovieQuery(input, supabase) {
 
   const keywordSignature = input.genres ? null : await matchKeywordSignature(supabase, cleanedQuery);
 
+  // STAGE 3: only meaningful when a signature actually matched and the user
+  // didn't already pin an explicit genre chip (that case is unambiguous —
+  // always literal/discover per the chip, mood routing doesn't apply).
+  const moodOnlyQuery =
+    !input.genres && keywordSignature != null && isMoodOnlyQuery(cleanedQuery, keywordSignature.matchedTerms);
+
+  const discoverGenres = moodOnlyQuery ? pickDiscoverGenres(keywordSignature.genreWeights) : undefined;
+
   return {
+    // TV SUPPORT FIX (2026-08-02) — see note above.
+    mediaType,
     searchText: cleanedQuery || undefined,
     rawQuery,
     exclusions,
     language: input.language || undefined,
     watchProviders: input.watchProviders || undefined,
     watchRegion: input.watchRegion || undefined,
-    genres: input.genres || (inferredGenreIds.length ? inferredGenreIds.join(",") : undefined),
+    genres:
+      input.genres ||
+      (inferredGenreIds.length ? inferredGenreIds.join(",") : undefined) ||
+      (discoverGenres || undefined),
     page: input.page ?? 1,
     // Real as of Stage 2 (2026-07-31) — see matchKeywordSignature() above.
     // Shape: { matchedTerms: string[], genreWeights: { [tmdbGenreId]: 0-1 } } | null
     keywordSignature,
+    // Real as of Stage 3 (2026-08-02) — see header note above. When true,
+    // index.ts/tmdb.ts route TMDB retrieval through /discover/movie (using
+    // `genres` above, derived from the matched signature) instead of the
+    // literal-text /search/movie tier.
+    moodOnlyQuery,
   };
 }
