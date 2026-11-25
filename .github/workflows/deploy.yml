@@ -13,7 +13,7 @@
 # Migrations (engine/supabase/migrations/*.sql) are NOT run by this
 # workflow — those are pasted into the Supabase Dashboard's SQL Editor by
 # hand for now. Function secrets (HARVEST_SECRET, etc.) are also managed
-# in the Dashboard, not here — see engine/.env.example for the full list.
+# in the Dashboard, not here — see engine/.env.example for the full list. 
 
 name: Deploy Supabase Edge Functions
 
