@@ -43,4 +43,4 @@ jobs:
       # the whole functions/ folder without naming each one individually.
       - name: Deploy Edge Functions
         working-directory: engine
-        run: supabase functions deploy --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}"
+        run: supabase functions deploy --project-ref "${{ secrets.SUPABASE_PROJECT_ID }}" --yes
