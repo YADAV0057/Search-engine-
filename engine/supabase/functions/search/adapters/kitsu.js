@@ -32,8 +32,11 @@ const STATUS_TO_KITSU = {
 export async function fetchFromKitsuFallback(plan, page = 1, limit = 10) {
     const params = new URLSearchParams();
     
-    const offset = (page - 1) * limit;
-    params.set('page[limit]', limit);
+    // Kitsu rejects page[limit] > 20 with HTTP 400. Cap it, and compute the
+    // offset from the capped value so pages don't skip or overlap.
+    const pageLimit = Math.min(limit, 20);
+    const offset = (page - 1) * pageLimit;
+    params.set('page[limit]', pageLimit);
     params.set('page[offset]', offset);
 
     // Kitsu has no rating-sort equivalent as clean as AniList's SCORE_DESC;
