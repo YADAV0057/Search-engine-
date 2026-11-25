@@ -41,9 +41,14 @@ const CATEGORY_ENTITY_TYPES = {
 // off GENRE/TAG.
 const NEGATABLE_CATEGORIES = new Set(['GENRE', 'TAG']);
 
-let cache = null;
-let cacheLoadedAt = 0;
-let warmingPromise = null;
+// Per-category lazy cache (timeout fix). A caller that only needs TAG/GENRE
+// (~440 rows) no longer pays for loading TITLE (~93k rows). Previously one
+// all-or-nothing cache meant every cold instance paged through every
+// category sequentially, even for empty-query home-page rows.
+const categoryCache = new Map();   // category -> { entries, loadedAt }
+const categoryLoading = new Map(); // category -> Promise<entries>
+
+const PARALLEL_PAGES = 10; // pages in flight at once, per instance
 
 // Exported (was module-private) so referenceTitle.js's phrase-vs-title
 // overlap scoring tokenizes identically to how these TITLE entries were
@@ -54,68 +59,78 @@ export function significantTokens(name) {
 }
 
 async function loadEntityType(supabase, entityType) {
+  const { count, error: countErr } = await supabase
+    .from('lexicon_entities')
+    .select('source_id', { count: 'exact', head: true })
+    .eq('entity_type', entityType);
+
+  if (countErr) {
+    console.error(`[queryClassifier] count error for entity_type=${entityType}`, countErr);
+    return [];
+  }
+  if (!count) return [];
+
+  const pageCount = Math.ceil(count / PAGE_SIZE);
   const rows = [];
-  let from = 0;
 
-  while (true) {
-    const { data, error } = await supabase
-      .from('lexicon_entities')
-      .select('name')
-      .eq('entity_type', entityType)
-      .range(from, from + PAGE_SIZE - 1);
-
-    if (error) {
-      console.error(`[queryClassifier] warm fetch error for entity_type=${entityType}`, error);
-      break;
+  for (let start = 0; start < pageCount; start += PARALLEL_PAGES) {
+    const batch = [];
+    for (let i = start; i < Math.min(start + PARALLEL_PAGES, pageCount); i++) {
+      const from = i * PAGE_SIZE;
+      batch.push(
+        supabase
+          .from('lexicon_entities')
+          .select('name')
+          .eq('entity_type', entityType)
+          // PK is (entity_type, source_id) -- stable ordering for parallel paging
+          .order('source_id', { ascending: true })
+          .range(from, from + PAGE_SIZE - 1)
+          .then(({ data, error }) => {
+            if (error) {
+              console.error(`[queryClassifier] page ${i} fetch error for entity_type=${entityType}`, error);
+              return [];
+            }
+            return data || [];
+          })
+      );
     }
-    if (!data || data.length === 0) break;
-
-    for (const row of data) {
-      if (!row.name) continue;
-      rows.push({ name: row.name, tokens: significantTokens(row.name) });
+    for (const page of await Promise.all(batch)) {
+      for (const row of page) {
+        if (!row.name) continue;
+        rows.push({ name: row.name, tokens: significantTokens(row.name) });
+      }
     }
-
-    if (data.length < PAGE_SIZE) break;
-    from += PAGE_SIZE;
   }
 
   return rows;
 }
 
-async function loadAllCategories(supabase) {
-  const map = new Map();
+async function getCategory(supabase, category) {
+  const hit = categoryCache.get(category);
+  const fresh = hit && (Date.now() - hit.loadedAt) < CACHE_TTL_MS;
+  if (fresh) return hit.entries;
 
-  for (const [category, entityTypes] of Object.entries(CATEGORY_ENTITY_TYPES)) {
-    const entries = [];
-    for (const entityType of entityTypes) {
-      entries.push(...(await loadEntityType(supabase, entityType)));
-    }
-    map.set(category, entries);
+  if (!categoryLoading.has(category)) {
+    const p = (async () => {
+      const entries = [];
+      for (const entityType of CATEGORY_ENTITY_TYPES[category]) {
+        entries.push(...(await loadEntityType(supabase, entityType)));
+      }
+      categoryCache.set(category, { entries, loadedAt: Date.now() });
+      return entries;
+    })().finally(() => categoryLoading.delete(category));
+    categoryLoading.set(category, p);
   }
 
-  return map;
+  if (hit) return hit.entries; // stale-while-revalidate, same as the old behavior
+  return categoryLoading.get(category);
 }
 
+// Only classifyQuery() (non-empty queries) needs every category.
 async function warmCache(supabase) {
-  const isStale = !cache || (Date.now() - cacheLoadedAt) > CACHE_TTL_MS;
-  if (!isStale) return cache;
-
-  if (!warmingPromise) {
-    warmingPromise = loadAllCategories(supabase)
-      .then((map) => {
-        cache = map;
-        cacheLoadedAt = Date.now();
-        warmingPromise = null;
-        return cache;
-      })
-      .catch((err) => {
-        warmingPromise = null;
-        throw err;
-      });
-  }
-
-  if (cache) return cache;
-  return warmingPromise;
+  const categories = Object.keys(CATEGORY_ENTITY_TYPES);
+  const lists = await Promise.all(categories.map((c) => getCategory(supabase, c)));
+  return new Map(categories.map((c, i) => [c, lists[i]]));
 }
 
 // Exclusion-system pass. Previously took a Set (queryTokenSet) and just
@@ -238,8 +253,7 @@ export async function classifyQuery(supabase, rawQuery, lexiconMatchedTerms = []
 // would ever run, so in practice this just returns the already-warm Map
 // entry with no extra DB round trip.
 export async function getTitleVocabEntries(supabase) {
-  const vocabByCategory = await warmCache(supabase);
-  return vocabByCategory.get('TITLE') || [];
+  return getCategory(supabase, 'TITLE');
 }
 
 // Entry 59 fix. Mirrors getTitleVocabEntries() immediately above -- same
@@ -254,8 +268,7 @@ export async function getTitleVocabEntries(supabase) {
 // header for why matching against the real vocab (not passing raw LLM
 // phrasing straight through) matters.
 export async function getTagVocabEntries(supabase) {
-  const vocabByCategory = await warmCache(supabase);
-  return vocabByCategory.get('TAG') || [];
+  return getCategory(supabase, 'TAG');
 }
 
 // Added for parser/tropeSignature.js (Notion "Backend Update List" Entry
@@ -269,8 +282,7 @@ export async function getTagVocabEntries(supabase) {
 // genre NAMES to constrain its LLM prompt to, the same way it already
 // needs getTagVocabEntries()'s real tag names -- this is that second half.
 export async function getGenreVocabEntries(supabase) {
-  const vocabByCategory = await warmCache(supabase);
-  return vocabByCategory.get('GENRE') || [];
+  return getCategory(supabase, 'GENRE');
 }
 
 export function rankCategories(scores) {
